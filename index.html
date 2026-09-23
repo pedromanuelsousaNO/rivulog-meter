@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RivuLog Meter Diagnostic</title>
+<style>
+:root{
+  --bg:#071417;--card:#102428;--card2:#153036;--ink:#eef8f7;
+  --muted:#9ec3bf;--accent:#4fd1c5;--danger:#ff7777;--warn:#ffd166;--line:#285057;
+}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#071114,#0b1d21);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:16px;border-bottom:1px solid var(--line);background:#081417}
+.brand{font-size:24px;font-weight:800}.tagline{font-size:12px;color:var(--muted);font-style:italic}
+.wrap{max-width:900px;margin:auto;padding:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+button,input,textarea{background:#0a1b1f;color:var(--ink);border:1px solid var(--line);padding:10px;border-radius:9px}
+button{cursor:pointer}.primary{background:var(--accent);color:#042322;font-weight:700}.danger{border-color:#844}
+button:disabled{opacity:.5;cursor:not-allowed}
+label{font-size:12px;color:var(--muted)}input,textarea{width:100%}
+.status{padding:8px 10px;border-radius:8px;background:#0a1b1f;border:1px solid var(--line)}
+.log{white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;background:#061013;border:1px solid var(--line);padding:10px;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.small{font-size:12px;color:var(--muted)}.warn{color:var(--warn)}.bad{color:var(--danger)}.ok{color:var(--accent)}
+code{background:#061013;padding:2px 5px;border-radius:5px}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">RivuLog Meter</div>
+  <div class="tagline">BLE-C600 diagnostic bridge</div>
+</header>
+
+<main class="wrap">
+  <div class="card">
+    <b>Purpose</b>
+    <div class="small" style="margin-top:6px">
+      This page does not guess or save measurements. It only connects to the BLE-C600,
+      lists accessible BLE services/characteristics and records raw packets so the meter protocol can be identified safely.
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>Tank (optional)</label>
+        <input id="tank" placeholder="T07">
+      </div>
+      <div>
+        <label>Device name starts with</label>
+        <input id="namePrefix" value="BLE-C600">
+      </div>
+    </div>
+
+    <div style="margin-top:10px">
+      <label>Optional service UUIDs</label>
+      <textarea id="services" rows="5">FFE0
+FFF0
+FF00
+6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+49535343-FE7D-4AE5-8FA9-9FAFD205E455
+180A
+180F
+181A</textarea>
+      <div class="small">You can add more service UUIDs later if the diagnostic reveals them.</div>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input id="showAll" type="checkbox" style="width:auto"> Show all nearby BLE devices
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="connectMeter()">Connect meter</button>
+      <button id="readBtn" disabled onclick="readAll()">Read all readable characteristics</button>
+      <button id="advBtn" disabled onclick="watchAdvertisements()">Watch advertisements</button>
+      <button onclick="disconnectMeter()">Disconnect</button>
+    </div>
+
+    <div id="status" class="status" style="margin-top:12px">Not connected.</div>
+    <div id="env" class="small" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>BLE diagnostic log</b>
+      <div class="row">
+        <button onclick="copyLog()">Copy log</button>
+        <button onclick="downloadLog()">Save log</button>
+        <button class="danger" onclick="clearLog()">Clear</button>
+      </div>
+    </div>
+    <div id="log" class="log" style="margin-top:10px">RivuLog BLE diagnostic log</div>
+  </div>
+
+  <div class="card small">
+    Run this page as a normal <b>HTTPS</b> page in desktop Chrome or Edge. Do not open it inside the Apps Script web-app frame.
+    After connecting, keep the meter powered on and place the probe in water so it sends live values.
+  </div>
+</main>
+
+<script>
+let DEVICE=null, SERVER=null, CHARACTERISTICS=[], ADV_HANDLER=null;
+
+const qs=new URLSearchParams(location.search);
+if(qs.get('tank')) document.getElementById('tank').value=qs.get('tank');
+
+function setStatus(text,cls=''){
+  const el=document.getElementById('status');
+  el.textContent=text;
+  el.className='status '+cls;
+}
+function log(text){
+  const el=document.getElementById('log');
+  const t=new Date().toLocaleTimeString();
+  el.textContent += '\n'+t+' '+text;
+  el.scrollTop=el.scrollHeight;
+}
+function normalizeUuid(v){
+  v=String(v||'').trim();
+  if(!v) return null;
+  if(/^0x[0-9a-f]{4}$/i.test(v)) v=v.slice(2);
+  if(/^[0-9a-f]{4}$/i.test(v)) return '0000'+v.toLowerCase()+'-0000-1000-8000-00805f9b34fb';
+  if(/^[0-9a-f]{8}$/i.test(v)) return v.toLowerCase()+'-0000-1000-8000-00805f9b34fb';
+  return v.toLowerCase();
+}
+function optionalServices(){
+  const vals=document.getElementById('services').value.split(/[\s,;]+/).map(normalizeUuid).filter(Boolean);
+  return [...new Set(vals)];
+}
+function bytesInfo(dv){
+  const u8=new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength);
+  const hex=[...u8].map(b=>b.toString(16).padStart(2,'0')).join(' ');
+  let txt='';
+  try{txt=new TextDecoder().decode(u8).replace(/[^\x20-\x7E]/g,'.')}catch(e){}
+  return {hex,txt,len:u8.length};
+}
+function props(p){
+  return ['read','write','writeWithoutResponse','notify','indicate','broadcast','authenticatedSignedWrites','reliableWrite','writableAuxiliaries']
+    .filter(k=>p && p[k]).join(',');
+}
+function onValueChanged(e){
+  const x=bytesInfo(e.target.value);
+  log(`RX ${e.target.service.uuid} / ${e.target.uuid} | ${x.len} bytes | ${x.hex} | ${x.txt}`);
+}
+
+async function connectMeter(){
+  try{
+    if(!window.isSecureContext) throw new Error('This page is not in a secure HTTPS context.');
+    if(!navigator.bluetooth) throw new Error('Web Bluetooth is not available in this browser.');
+    disconnectMeter(false);
+
+    const prefix=document.getElementById('namePrefix').value.trim();
+    const showAll=document.getElementById('showAll').checked;
+    const services=optionalServices();
+
+    const opts=showAll
+      ? {acceptAllDevices:true, optionalServices:services}
+      : {filters:[{namePrefix:prefix||'BLE-C600'}], optionalServices:services};
+
+    setStatus('Choose the meter in the Bluetooth dialog…');
+    log(`requestDevice: ${showAll?'all devices':'namePrefix='+prefix}`);
+    log(`optionalServices: ${services.join(', ')}`);
+
+    DEVICE=await navigator.bluetooth.requestDevice(opts);
+    DEVICE.addEventListener('gattserverdisconnected',()=>setStatus('Disconnected.','warn'));
+    log(`Device selected: ${DEVICE.name||'(unnamed)'} | id=${DEVICE.id}`);
+
+    setStatus('Connecting…');
+    SERVER=await DEVICE.gatt.connect();
+    setStatus('Connected to '+(DEVICE.name||'BLE device'),'ok');
+    log('GATT connected.');
+
+    CHARACTERISTICS=[];
+    const found=await SERVER.getPrimaryServices();
+    log(`Accessible primary services: ${found.length}`);
+
+    for(const svc of found){
+      log(`SERVICE ${svc.uuid}`);
+      let chars=[];
+      try{ chars=await svc.getCharacteristics(); }
+      catch(e){ log(`  getCharacteristics failed: ${e.message}`); continue; }
+
+      for(const ch of chars){
+        CHARACTERISTICS.push(ch);
+        log(`  CHAR ${ch.uuid} | ${props(ch.properties)||'no listed properties'}`);
+
+        if(ch.properties.read){
+          try{
+            const dv=await ch.readValue();
+            const x=bytesInfo(dv);
+            log(`    READ ${x.len} bytes | ${x.hex} | ${x.txt}`);
+          }catch(e){ log(`    read failed: ${e.message}`); }
+        }
+
+        if(ch.properties.notify || ch.properties.indicate){
+          try{
+            await ch.startNotifications();
+            ch.removeEventListener('characteristicvaluechanged',onValueChanged);
+            ch.addEventListener('characteristicvaluechanged',onValueChanged);
+            log('    notifications STARTED');
+          }catch(e){ log(`    notification failed: ${e.message}`); }
+        }
+      }
+    }
+
+    document.getElementById('readBtn').disabled=!CHARACTERISTICS.some(c=>c.properties.read);
+    document.getElementById('advBtn').disabled=typeof DEVICE.watchAdvertisements!=='function';
+
+    if(!found.length){
+      log('No accessible services were returned. Add the meter service UUID to the Optional service UUIDs box, reconnect, and try again.');
+    }
+  }catch(e){
+    setStatus('Connection failed: '+e.message,'bad');
+    log('ERROR '+e.name+': '+e.message);
+  }
+}
+
+async function readAll(){
+  if(!SERVER?.connected) return log('Not connected.');
+  for(const ch of CHARACTERISTICS.filter(c=>c.properties.read)){
+    try{
+      const dv=await ch.readValue();
+      const x=bytesInfo(dv);
+      log(`READ ${ch.service.uuid} / ${ch.uuid} | ${x.len} bytes | ${x.hex} | ${x.txt}`);
+    }catch(e){ log(`READ ERROR ${ch.uuid}: ${e.message}`); }
+  }
+}
+
+async function watchAdvertisements(){
+  try{
+    if(!DEVICE) throw new Error('Connect/select the meter first.');
+    if(typeof DEVICE.watchAdvertisements!=='function') throw new Error('watchAdvertisements is not supported by this browser.');
+    if(!ADV_HANDLER){
+      ADV_HANDLER=e=>{
+        const su=(e.uuids||e.serviceUuids||[]).join(',');
+        log(`ADV name=${e.name||DEVICE.name||''} rssi=${e.rssi??''} tx=${e.txPower??''} services=${su}`);
+        try{
+          for(const [k,v] of e.manufacturerData||[]){
+            const x=bytesInfo(v); log(`  manufacturer ${k}: ${x.hex} | ${x.txt}`);
+          }
+          for(const [k,v] of e.serviceData||[]){
+            const x=bytesInfo(v); log(`  serviceData ${k}: ${x.hex} | ${x.txt}`);
+          }
+        }catch(err){ log('  advertisement decode warning: '+err.message); }
+      };
+      DEVICE.addEventListener('advertisementreceived',ADV_HANDLER);
+    }
+    await DEVICE.watchAdvertisements();
+    log('Advertisement watching started. Move/use the meter for 20–30 seconds.');
+  }catch(e){ log('ADV ERROR: '+e.message); }
+}
+
+function disconnectMeter(writeLog=true){
+  try{
+    CHARACTERISTICS.forEach(ch=>{
+      try{ch.removeEventListener('characteristicvaluechanged',onValueChanged)}catch(e){}
+    });
+    if(DEVICE?.gatt?.connected) DEVICE.gatt.disconnect();
+  }catch(e){}
+  CHARACTERISTICS=[]; SERVER=null;
+  if(writeLog) log('Disconnected.');
+  setStatus('Not connected.');
+  document.getElementById('readBtn').disabled=true;
+  document.getElementById('advBtn').disabled=true;
+}
+
+async function copyLog(){
+  try{await navigator.clipboard.writeText(document.getElementById('log').textContent);log('Diagnostic log copied to clipboard.')}
+  catch(e){log('Copy failed: '+e.message);}
+}
+function downloadLog(){
+  const tank=document.getElementById('tank').value.trim()||'unknown-tank';
+  const blob=new Blob([document.getElementById('log').textContent],{type:'text/plain'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`RivuLog-BLE-${tank}-${new Date().toISOString().replace(/[:.]/g,'-')}.txt`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function clearLog(){document.getElementById('log').textContent='RivuLog BLE diagnostic log';}
+
+document.getElementById('env').textContent =
+  `Secure context: ${window.isSecureContext?'yes':'NO'} • Web Bluetooth: ${navigator.bluetooth?'available':'not available'} • Browser: ${navigator.userAgent}`;
+
+window.addEventListener('beforeunload',()=>disconnectMeter(false));
+</script>
+</body>
+</html>
