@@ -48,13 +48,14 @@ code{background:#061013;padding:2px 5px;border-radius:5px}
       </div>
       <div>
         <label>Device name starts with</label>
-        <input id="namePrefix" value="BLE-C600">
+        <input id="namePrefix" value="BLE-9908">
       </div>
     </div>
 
     <div style="margin-top:10px">
       <label>Optional service UUIDs</label>
-      <textarea id="services" rows="5">FFE0
+      <textarea id="services" rows="6">FF01
+FFE0
 FFF0
 FF00
 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -67,7 +68,7 @@ FF00
 
     <div class="row" style="margin-top:12px">
       <label style="display:flex;align-items:center;gap:6px">
-        <input id="showAll" type="checkbox" style="width:auto"> Show all nearby BLE devices
+        <input id="showAll" type="checkbox" style="width:auto" checked> Show all nearby BLE devices
       </label>
     </div>
 
@@ -96,12 +97,14 @@ FF00
 
   <div class="card small">
     Run this page as a normal <b>HTTPS</b> page in desktop Chrome or Edge. Do not open it inside the Apps Script web-app frame.
-    After connecting, keep the meter powered on and place the probe in water so it sends live values.
+    After connecting, keep the meter powered on and place the probe in water for 20–30 seconds. The page will try the YINMIK FF01/FF02 data channel and poll FF02 automatically if available.
   </div>
 </main>
 
 <script>
-let DEVICE=null, SERVER=null, CHARACTERISTICS=[], ADV_HANDLER=null;
+let DEVICE=null, SERVER=null, CHARACTERISTICS=[], ADV_HANDLER=null, TARGET_CHAR=null, TARGET_POLL=null;
+const TARGET_SERVICE_UUID='0000ff01-0000-1000-8000-00805f9b34fb';
+const TARGET_CHAR_UUID='0000ff02-0000-1000-8000-00805f9b34fb';
 
 const qs=new URLSearchParams(location.search);
 if(qs.get('tank')) document.getElementById('tank').value=qs.get('tank');
@@ -205,6 +208,40 @@ async function connectMeter(){
       }
     }
 
+    // YINMIK BLE-99xx documentation identifies FF01 / FF02 as the data channel.
+    // Try it explicitly after discovery; optionalServices already includes FF01.
+    try{
+      const targetService=await SERVER.getPrimaryService(TARGET_SERVICE_UUID);
+      TARGET_CHAR=await targetService.getCharacteristic(TARGET_CHAR_UUID);
+      if(!CHARACTERISTICS.some(c=>c.uuid.toLowerCase()===TARGET_CHAR_UUID)) CHARACTERISTICS.push(TARGET_CHAR);
+      log(`TARGET FF01/FF02 found | ${props(TARGET_CHAR.properties)||'no listed properties'}`);
+      if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){
+        try{
+          await TARGET_CHAR.startNotifications();
+          TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValueChanged);
+          TARGET_CHAR.addEventListener('characteristicvaluechanged',onValueChanged);
+          log('TARGET FF02 notifications STARTED');
+        }catch(e){log('TARGET notification failed: '+e.message)}
+      }
+      if(TARGET_CHAR.properties.read){
+        try{
+          const dv=await TARGET_CHAR.readValue(),x=bytesInfo(dv);
+          log(`TARGET FF02 READ ${x.len} bytes | ${x.hex} | ${x.txt}`);
+        }catch(e){log('TARGET initial read failed: '+e.message)}
+        if(TARGET_POLL) clearInterval(TARGET_POLL);
+        TARGET_POLL=setInterval(async()=>{
+          try{
+            if(!SERVER?.connected||!TARGET_CHAR) return;
+            const dv=await TARGET_CHAR.readValue(),x=bytesInfo(dv);
+            log(`TARGET FF02 POLL ${x.len} bytes | ${x.hex} | ${x.txt}`);
+          }catch(e){log('TARGET poll read failed: '+e.message)}
+        },750);
+        log('TARGET FF02 polling started every 750 ms. Leave the probe in water for 20–30 seconds.');
+      }
+    }catch(e){
+      log('TARGET FF01/FF02 not accessible: '+e.message);
+    }
+
     document.getElementById('readBtn').disabled=!CHARACTERISTICS.some(c=>c.properties.read);
     document.getElementById('advBtn').disabled=typeof DEVICE.watchAdvertisements!=='function';
 
@@ -253,6 +290,8 @@ async function watchAdvertisements(){
 }
 
 function disconnectMeter(writeLog=true){
+  if(TARGET_POLL){clearInterval(TARGET_POLL);TARGET_POLL=null}
+  TARGET_CHAR=null;
   try{
     CHARACTERISTICS.forEach(ch=>{
       try{ch.removeEventListener('characteristicvaluechanged',onValueChanged)}catch(e){}
