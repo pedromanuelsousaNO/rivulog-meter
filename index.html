@@ -52,11 +52,13 @@ details summary{cursor:pointer}
   </details>
 
   <div class="card small">
-    RivuLog decodes the verified FF01 / FF02 24-byte data stream. pH, EC, TDS and temperature are used. If EC/TDS reaches the meter's high-range limit, RivuLog flags that the reading may be clipped.
+    RivuLog decodes the verified FF01 / FF02 24-byte data stream. pH, EC, TDS and temperature are used. The live values are read once per second while connected. RivuLog accepts a naturally stable reading as soon as the stability limits are met; otherwise the latest valid reading becomes ready after 20 seconds. If EC/TDS reaches the meter's high-range limit, RivuLog flags that the reading may be clipped.
   </div>
 </main>
 <script>
-let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0;
+let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, POLL_TIMER=null, STABILIZE_TIMER=null, FIRST_VALID_AT=0, READY_BY_TIMEOUT=false, POLL_BUSY=false;
+const POLL_MS=1000;
+const STABILIZE_MAX_MS=20000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
 const qs=new URLSearchParams(location.search);
@@ -107,13 +109,44 @@ function isStable(){
   const ecBase=Math.max(1,h[h.length-1].EC_uScm),tdsBase=Math.max(1,h[h.length-1].TDS_ppm);
   return p<=0.04 && t<=0.3 && ec<=Math.max(5,ecBase*.02) && tds<=Math.max(3,tdsBase*.02);
 }
+function isReady(){return !!LAST&&(isStable()||READY_BY_TIMEOUT)}
+function startStabilizeTimer(){
+  if(FIRST_VALID_AT||STABILIZE_TIMER)return;
+  FIRST_VALID_AT=Date.now();
+  STABILIZE_TIMER=setTimeout(()=>{
+    STABILIZE_TIMER=null;
+    if(!LAST)return;
+    if(!isStable()){
+      READY_BY_TIMEOUT=true;
+      log('Stabilization limit reached after 20 s; latest valid reading is ready to save.');
+    }
+    updateStable();
+  },STABILIZE_MAX_MS);
+}
+function stopStabilizeTimer(){
+  if(STABILIZE_TIMER){clearTimeout(STABILIZE_TIMER);STABILIZE_TIMER=null}
+}
 function updateStable(){
   const st=isStable(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
   if(!LAST){pill.textContent='Waiting for reading';pill.className='pill';btn.disabled=true;return}
-  if(LAST.clipped){pill.textContent='Stable / meter limit';pill.className='pill warn'}
-  else if(st){pill.textContent='Stable';pill.className='pill ok'}
-  else {pill.textContent='Stabilizing…';pill.className='pill'}
-  btn.disabled=!st;
+  if(st){
+    stopStabilizeTimer();
+    if(LAST.clipped){pill.textContent='Stable / meter limit';pill.className='pill warn'}
+    else {pill.textContent='Stable';pill.className='pill ok'}
+    btn.disabled=false;
+    return;
+  }
+  if(READY_BY_TIMEOUT){
+    pill.textContent='Ready — 20s max';
+    pill.className='pill warn';
+    btn.disabled=false;
+    return;
+  }
+  const elapsed=FIRST_VALID_AT?Math.max(0,Math.floor((Date.now()-FIRST_VALID_AT)/1000)):0;
+  const left=Math.max(0,20-elapsed);
+  pill.textContent=FIRST_VALID_AT?`Stabilizing… ${left}s`:'Stabilizing…';
+  pill.className='pill';
+  btn.disabled=true;
 }
 function handlePacket(dv,source='RX'){
   try{
@@ -126,35 +159,78 @@ function handlePacket(dv,source='RX'){
     if(now-LAST_PACKET_AT<350 && LAST && r.pH===LAST.pH && r.EC_uScm===LAST.EC_uScm && r.TDS_ppm===LAST.TDS_ppm && r.Temperature_C===LAST.Temperature_C)return;
     LAST_PACKET_AT=now;
     r.rawHex=hexOf(u8);r.measuredAt=new Date().toISOString();LAST=r;HISTORY.push(r);if(HISTORY.length>20)HISTORY.shift();
+    startStabilizeTimer();
     renderReading(r);updateStable();
     log(`${source} pH=${r.pH.toFixed(2)} EC=${displayEC(r.EC_uScm).value} ${displayEC(r.EC_uScm).unit} TDS=${r.TDS_ppm} ppm T=${r.Temperature_C.toFixed(1)} C`);
     if(r.clipped)document.getElementById('saveState').textContent='EC/TDS are at the verified high-range limit; the true value may be higher.';
   }catch(e){log('DECODE ERROR: '+e.message)}
 }
 function onValue(e){handlePacket(e.target.value,'NOTIFY')}
+function stopPolling(){
+  if(POLL_TIMER){clearInterval(POLL_TIMER);POLL_TIMER=null}
+  POLL_BUSY=false;
+}
+function startPolling(){
+  stopPolling();
+  if(!TARGET_CHAR||!TARGET_CHAR.properties.read)return;
+  POLL_TIMER=setInterval(async()=>{
+    if(POLL_BUSY||!TARGET_CHAR||!DEVICE?.gatt?.connected)return;
+    POLL_BUSY=true;
+    try{
+      const dv=await TARGET_CHAR.readValue();
+      handlePacket(dv,'POLL');
+    }catch(e){
+      log('Poll read failed: '+e.message);
+    }finally{
+      POLL_BUSY=false;
+    }
+  },POLL_MS);
+  log('Live read polling started every 1 s.');
+}
 async function connectMeter(){
   try{
     if(!window.isSecureContext)throw new Error('HTTPS secure context is required.');
     if(!navigator.bluetooth)throw new Error('Web Bluetooth is not available. Use desktop Chrome or Edge.');
-    disconnectMeter(false);HISTORY=[];LAST=null;updateStable();document.getElementById('saveState').textContent='';
+    disconnectMeter(false);
+    HISTORY=[];LAST=null;LAST_PACKET_AT=0;FIRST_VALID_AT=0;READY_BY_TIMEOUT=false;stopStabilizeTimer();updateStable();
+    document.getElementById('saveState').textContent='';
     setStatus('Choose BLE-9908 in the Bluetooth dialog…');
     DEVICE=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
     log(`Device selected: ${DEVICE.name||'(unnamed)'}`);
-    DEVICE.addEventListener('gattserverdisconnected',()=>{setStatus('Disconnected.','warn');document.getElementById('confirmBtn').disabled=true});
+    DEVICE.addEventListener('gattserverdisconnected',()=>{
+      stopPolling();stopStabilizeTimer();
+      setStatus('Disconnected.','warn');
+      document.getElementById('confirmBtn').disabled=true;
+    });
     SERVER=await DEVICE.gatt.connect();setStatus('Connected to '+(DEVICE.name||'BLE device'),'ok');
     const svc=await SERVER.getPrimaryService(SERVICE);TARGET_CHAR=await svc.getCharacteristic(CHAR);
     log('FF01 / FF02 connected: read='+!!TARGET_CHAR.properties.read+' notify='+!!TARGET_CHAR.properties.notify);
-    if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){await TARGET_CHAR.startNotifications();TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);log('FF02 notifications started.')}
-    if(TARGET_CHAR.properties.read){try{handlePacket(await TARGET_CHAR.readValue(),'READ')}catch(e){log('Initial read failed: '+e.message)}}
-  }catch(e){setStatus('Connection failed: '+e.message,'bad');log('ERROR '+e.name+': '+e.message)}
+    if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){
+      await TARGET_CHAR.startNotifications();
+      TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);
+      log('FF02 notifications started.');
+    }
+    if(TARGET_CHAR.properties.read){
+      try{handlePacket(await TARGET_CHAR.readValue(),'READ')}catch(e){log('Initial read failed: '+e.message)}
+      startPolling();
+    }
+  }catch(e){
+    stopPolling();stopStabilizeTimer();
+    setStatus('Connection failed: '+e.message,'bad');log('ERROR '+e.name+': '+e.message)
+  }
 }
 function disconnectMeter(write=true){
+  stopPolling();stopStabilizeTimer();
   try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
-  TARGET_CHAR=null;SERVER=null;if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true
+  TARGET_CHAR=null;SERVER=null;
+  if(write)log('Disconnected.');
+  setStatus('Not connected.');
+  document.getElementById('confirmBtn').disabled=true
 }
 function confirmMeasurement(){
-  if(!LAST||!isStable())return;
-  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable:true,clipped:LAST.clipped,rawHex:LAST.rawHex};
+  if(!LAST||!isReady())return;
+  const naturallyStable=isStable();
+  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable:true,naturallyStable:naturallyStable,stabilizationTimedOut:!naturallyStable&&READY_BY_TIMEOUT,clipped:LAST.clipped,rawHex:LAST.rawHex};
   if(window.opener&&!window.opener.closed){
     document.getElementById('saveState').textContent='Sending measurement back to RivuLog…';
     window.opener.postMessage(payload,'*');
