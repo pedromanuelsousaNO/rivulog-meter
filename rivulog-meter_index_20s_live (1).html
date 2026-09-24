@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RivuLog Meter</title>
+<style>
+:root{--bg:#071417;--card:#102428;--card2:#153036;--ink:#eef8f7;--muted:#9ec3bf;--accent:#4fd1c5;--danger:#ff7777;--warn:#ffd166;--ok:#7bd389;--line:#285057}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#071114,#0b1d21);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:14px 16px;border-bottom:1px solid var(--line);background:#081417;position:sticky;top:0;z-index:10}
+.brand{font-size:24px;font-weight:850}.tagline{font-size:12px;color:var(--muted);font-style:italic}
+.wrap{max-width:900px;margin:auto;padding:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.between{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(130px,1fr));gap:10px}.metric{background:#0a1b1f;border:1px solid var(--line);border-radius:12px;padding:15px;text-align:center}.metric b{display:block;font-size:30px}.metric span{font-size:12px;color:var(--muted)}
+button,input,textarea{background:#0a1b1f;color:var(--ink);border:1px solid var(--line);padding:10px;border-radius:9px}button{cursor:pointer}.primary{background:var(--accent);color:#042322;font-weight:750}.danger{border-color:#844}button:disabled{opacity:.45;cursor:not-allowed}
+label{font-size:12px;color:var(--muted)}input,textarea{width:100%}.status{padding:9px 10px;border-radius:8px;background:#0a1b1f;border:1px solid var(--line)}
+.log{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#061013;border:1px solid var(--line);padding:10px;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.small{font-size:12px;color:var(--muted)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--danger)}.pill{font-size:12px;padding:5px 8px;border-radius:999px;background:#16383c}
+details summary{cursor:pointer}
+@media(max-width:560px){.wrap{padding:9px}.metric b{font-size:26px}}
+</style>
+</head>
+<body>
+<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement</div></header>
+<main class="wrap">
+  <div class="card">
+    <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
+    <div class="grid" style="margin-top:12px">
+      <div class="metric"><span>pH</span><b id="mPH">—</b></div>
+      <div class="metric"><span>EC</span><b id="mEC">—</b><span id="mECUnit">µS/cm</span></div>
+      <div class="metric"><span>TDS</span><b id="mTDS">—</b><span>ppm</span></div>
+      <div class="metric"><span>Temperature</span><b id="mTemp">—</b><span>°C</span></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="connectBtn" class="primary" onclick="connectMeter()">Connect meter</button>
+      <button id="confirmBtn" class="primary" disabled onclick="confirmMeasurement()">Confirm &amp; Save</button>
+      <button onclick="disconnectMeter()">Disconnect</button>
+    </div>
+    <div id="status" class="status" style="margin-top:10px">Not connected.</div>
+    <div id="saveState" class="small" style="margin-top:7px"></div>
+  </div>
+
+  <details class="card">
+    <summary><b>Diagnostic details</b></summary>
+    <div class="row" style="margin-top:12px">
+      <label style="display:flex;align-items:center;gap:6px"><input id="showAll" type="checkbox" style="width:auto" checked> Show all nearby BLE devices</label>
+    </div>
+    <div class="small" style="margin:8px 0">BLE-9908 does not advertise its name reliably, so leave this checked.</div>
+    <div class="between"><b>BLE log</b><div class="row"><button onclick="copyLog()">Copy log</button><button onclick="clearLog()">Clear</button></div></div>
+    <div id="log" class="log" style="margin-top:8px">RivuLog BLE diagnostic log</div>
+  </details>
+
+  <div class="card small">
+    RivuLog decodes the verified FF01 / FF02 24-byte data stream. pH, EC, TDS and temperature are used. The live values are read once per second while connected. RivuLog accepts a naturally stable reading as soon as the stability limits are met; otherwise the latest valid reading becomes ready after 20 seconds. If EC/TDS reaches the meter's high-range limit, RivuLog flags that the reading may be clipped.
+  </div>
+</main>
+<script>
+let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, POLL_TIMER=null, STABILIZE_TIMER=null, FIRST_VALID_AT=0, READY_BY_TIMEOUT=false, POLL_BUSY=false;
+const POLL_MS=1000;
+const STABILIZE_MAX_MS=20000;
+const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
+const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
+const qs=new URLSearchParams(location.search);
+const TANK=qs.get('tank')||'';
+document.getElementById('tankLabel').textContent=TANK||'Not supplied';
+
+function setStatus(t,cls=''){const e=document.getElementById('status');e.textContent=t;e.className='status '+cls}
+function log(t){const e=document.getElementById('log');e.textContent+='\n'+new Date().toLocaleTimeString()+' '+t;e.scrollTop=e.scrollHeight}
+function hexOf(u8){return [...u8].map(b=>b.toString(16).padStart(2,'0')).join(' ')}
+function u16(a,i){return (a[i]<<8)+a[i+1]}
+function decryptPacket(input){
+  const a=[...input];
+  if(a.length!==24)throw new Error('Expected 24-byte FF02 packet, got '+a.length);
+  for(let i=a.length-1;i>0;i--){
+    let tmp=a[i],hibit1=(tmp&0x55)<<1,lobit1=(tmp&0xAA)>>1;
+    tmp=a[i-1];let hibit=(tmp&0x55)<<1,lobit=(tmp&0xAA)>>1;
+    a[i]=(0xff-(hibit1|lobit))&0xff;
+    a[i-1]=(0xff-(hibit|lobit1))&0xff;
+  }
+  return a;
+}
+function decodePacket(u8){
+  const d=decryptPacket(u8);
+  const ph=u16(d,3)/100, ecRaw=u16(d,5), tds=u16(d,7), temp=u16(d,13)/10;
+  // Verified low range: EC raw = µS/cm. Verified clipped high-range sample:
+  // raw EC 1999 + TDS 9990 = app 19.99 mS/cm, therefore canonical EC = 19,990 µS/cm.
+  // Keep this conversion deliberately conservative until intermediate mS/cm values are tested.
+  const verifiedHigh=(ecRaw===1999 && tds>=9990);
+  const ec_uScm=verifiedHigh?19990:ecRaw;
+  return {pH:ph,EC_uScm:ec_uScm,TDS_ppm:tds,Temperature_C:temp,ecRaw,highRange:verifiedHigh,clipped:verifiedHigh&&tds>=9990,decoded:d};
+}
+function validReading(r){return r&&r.pH>=0&&r.pH<=14&&r.EC_uScm>=0&&r.TDS_ppm>=0&&r.Temperature_C>=0&&r.Temperature_C<=60}
+function displayEC(v){return v>=10000?{value:(v/1000).toFixed(2),unit:'mS/cm'}:{value:String(Math.round(v)),unit:'µS/cm'}}
+function renderReading(r){
+  const ec=displayEC(r.EC_uScm);
+  document.getElementById('mPH').textContent=r.pH.toFixed(2);
+  document.getElementById('mEC').textContent=ec.value;
+  document.getElementById('mECUnit').textContent=ec.unit;
+  document.getElementById('mTDS').textContent=Math.round(r.TDS_ppm);
+  document.getElementById('mTemp').textContent=r.Temperature_C.toFixed(1);
+}
+function spread(vals){return Math.max(...vals)-Math.min(...vals)}
+function isStable(){
+  if(HISTORY.length<6)return false;
+  const h=HISTORY.slice(-8);
+  const p=spread(h.map(x=>x.pH)), t=spread(h.map(x=>x.Temperature_C));
+  const ec=spread(h.map(x=>x.EC_uScm)), tds=spread(h.map(x=>x.TDS_ppm));
+  const ecBase=Math.max(1,h[h.length-1].EC_uScm),tdsBase=Math.max(1,h[h.length-1].TDS_ppm);
+  return p<=0.04 && t<=0.3 && ec<=Math.max(5,ecBase*.02) && tds<=Math.max(3,tdsBase*.02);
+}
+function isReady(){return !!LAST&&(isStable()||READY_BY_TIMEOUT)}
+function startStabilizeTimer(){
+  if(FIRST_VALID_AT||STABILIZE_TIMER)return;
+  FIRST_VALID_AT=Date.now();
+  STABILIZE_TIMER=setTimeout(()=>{
+    STABILIZE_TIMER=null;
+    if(!LAST)return;
+    if(!isStable()){
+      READY_BY_TIMEOUT=true;
+      log('Stabilization limit reached after 20 s; latest valid reading is ready to save.');
+    }
+    updateStable();
+  },STABILIZE_MAX_MS);
+}
+function stopStabilizeTimer(){
+  if(STABILIZE_TIMER){clearTimeout(STABILIZE_TIMER);STABILIZE_TIMER=null}
+}
+function updateStable(){
+  const st=isStable(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
+  if(!LAST){pill.textContent='Waiting for reading';pill.className='pill';btn.disabled=true;return}
+  if(st){
+    stopStabilizeTimer();
+    if(LAST.clipped){pill.textContent='Stable / meter limit';pill.className='pill warn'}
+    else {pill.textContent='Stable';pill.className='pill ok'}
+    btn.disabled=false;
+    return;
+  }
+  if(READY_BY_TIMEOUT){
+    pill.textContent='Ready — 20s max';
+    pill.className='pill warn';
+    btn.disabled=false;
+    return;
+  }
+  const elapsed=FIRST_VALID_AT?Math.max(0,Math.floor((Date.now()-FIRST_VALID_AT)/1000)):0;
+  const left=Math.max(0,20-elapsed);
+  pill.textContent=FIRST_VALID_AT?`Stabilizing… ${left}s`:'Stabilizing…';
+  pill.className='pill';
+  btn.disabled=true;
+}
+function handlePacket(dv,source='RX'){
+  try{
+    const u8=new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength);
+    if(u8.length!==24)return;
+    const r=decodePacket(u8);
+    if(!validReading(r))return;
+    const now=Date.now();
+    // The meter can produce duplicate read+notify events. Keep one decoded sample per 350 ms.
+    if(now-LAST_PACKET_AT<350 && LAST && r.pH===LAST.pH && r.EC_uScm===LAST.EC_uScm && r.TDS_ppm===LAST.TDS_ppm && r.Temperature_C===LAST.Temperature_C)return;
+    LAST_PACKET_AT=now;
+    r.rawHex=hexOf(u8);r.measuredAt=new Date().toISOString();LAST=r;HISTORY.push(r);if(HISTORY.length>20)HISTORY.shift();
+    startStabilizeTimer();
+    renderReading(r);updateStable();
+    log(`${source} pH=${r.pH.toFixed(2)} EC=${displayEC(r.EC_uScm).value} ${displayEC(r.EC_uScm).unit} TDS=${r.TDS_ppm} ppm T=${r.Temperature_C.toFixed(1)} C`);
+    if(r.clipped)document.getElementById('saveState').textContent='EC/TDS are at the verified high-range limit; the true value may be higher.';
+  }catch(e){log('DECODE ERROR: '+e.message)}
+}
+function onValue(e){handlePacket(e.target.value,'NOTIFY')}
+function stopPolling(){
+  if(POLL_TIMER){clearInterval(POLL_TIMER);POLL_TIMER=null}
+  POLL_BUSY=false;
+}
+function startPolling(){
+  stopPolling();
+  if(!TARGET_CHAR||!TARGET_CHAR.properties.read)return;
+  POLL_TIMER=setInterval(async()=>{
+    if(POLL_BUSY||!TARGET_CHAR||!DEVICE?.gatt?.connected)return;
+    POLL_BUSY=true;
+    try{
+      const dv=await TARGET_CHAR.readValue();
+      handlePacket(dv,'POLL');
+    }catch(e){
+      log('Poll read failed: '+e.message);
+    }finally{
+      POLL_BUSY=false;
+    }
+  },POLL_MS);
+  log('Live read polling started every 1 s.');
+}
+async function connectMeter(){
+  try{
+    if(!window.isSecureContext)throw new Error('HTTPS secure context is required.');
+    if(!navigator.bluetooth)throw new Error('Web Bluetooth is not available. Use desktop Chrome or Edge.');
+    disconnectMeter(false);
+    HISTORY=[];LAST=null;LAST_PACKET_AT=0;FIRST_VALID_AT=0;READY_BY_TIMEOUT=false;stopStabilizeTimer();updateStable();
+    document.getElementById('saveState').textContent='';
+    setStatus('Choose BLE-9908 in the Bluetooth dialog…');
+    DEVICE=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
+    log(`Device selected: ${DEVICE.name||'(unnamed)'}`);
+    DEVICE.addEventListener('gattserverdisconnected',()=>{
+      stopPolling();stopStabilizeTimer();
+      setStatus('Disconnected.','warn');
+      document.getElementById('confirmBtn').disabled=true;
+    });
+    SERVER=await DEVICE.gatt.connect();setStatus('Connected to '+(DEVICE.name||'BLE device'),'ok');
+    const svc=await SERVER.getPrimaryService(SERVICE);TARGET_CHAR=await svc.getCharacteristic(CHAR);
+    log('FF01 / FF02 connected: read='+!!TARGET_CHAR.properties.read+' notify='+!!TARGET_CHAR.properties.notify);
+    if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){
+      await TARGET_CHAR.startNotifications();
+      TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);
+      log('FF02 notifications started.');
+    }
+    if(TARGET_CHAR.properties.read){
+      try{handlePacket(await TARGET_CHAR.readValue(),'READ')}catch(e){log('Initial read failed: '+e.message)}
+      startPolling();
+    }
+  }catch(e){
+    stopPolling();stopStabilizeTimer();
+    setStatus('Connection failed: '+e.message,'bad');log('ERROR '+e.name+': '+e.message)
+  }
+}
+function disconnectMeter(write=true){
+  stopPolling();stopStabilizeTimer();
+  try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
+  TARGET_CHAR=null;SERVER=null;
+  if(write)log('Disconnected.');
+  setStatus('Not connected.');
+  document.getElementById('confirmBtn').disabled=true
+}
+function confirmMeasurement(){
+  if(!LAST||!isReady())return;
+  const naturallyStable=isStable();
+  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable:true,naturallyStable:naturallyStable,stabilizationTimedOut:!naturallyStable&&READY_BY_TIMEOUT,clipped:LAST.clipped,rawHex:LAST.rawHex};
+  if(window.opener&&!window.opener.closed){
+    document.getElementById('saveState').textContent='Sending measurement back to RivuLog…';
+    window.opener.postMessage(payload,'*');
+    setTimeout(()=>window.close(),700);
+  }else{
+    navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
+  }
+}
+async function copyLog(){try{await navigator.clipboard.writeText(document.getElementById('log').textContent)}catch(e){}}
+function clearLog(){document.getElementById('log').textContent='RivuLog BLE diagnostic log'}
+window.addEventListener('beforeunload',()=>disconnectMeter(false));
+</script>
+</body>
+</html>
