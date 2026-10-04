@@ -22,7 +22,7 @@ details summary{cursor:pointer}
 </style>
 </head>
 <body>
-<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.1</div></header>
+<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.2</div></header>
 <main class="wrap">
   <div class="card">
     <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
@@ -60,6 +60,7 @@ details summary{cursor:pointer}
 let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, ARMED=false;
 let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
 let READ_POLL_TIMER=null, READ_IN_FLIGHT=false, PREVIOUS_TANK_FINGERPRINT='', SAME_READING_GRACE_UNTIL=0;
+let SAVE_PENDING=false, PENDING_MESSAGE_ID='', PENDING_TANK='';
 const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
@@ -70,6 +71,7 @@ document.getElementById('tankLabel').textContent=TANK||'Choose a tank in RivuLog
 
 function setStatus(t,cls=''){const e=document.getElementById('status');e.textContent=t;e.className='status '+cls}
 function log(t){const e=document.getElementById('log');e.textContent+='\n'+new Date().toLocaleTimeString()+' '+t;e.scrollTop=e.scrollHeight}
+function newMessageId(){return (crypto?.randomUUID?crypto.randomUUID():('m-'+Date.now()+'-'+Math.random().toString(36).slice(2)))}
 function hexOf(u8){return [...u8].map(b=>b.toString(16).padStart(2,'0')).join(' ')}
 function u16(a,i){return (a[i]<<8)+a[i+1]}
 function decryptPacket(input){
@@ -123,8 +125,9 @@ function startStabilizeTimer(){
 }
 function updateStable(){
   const st=isStable(),timedOut=stabilizationTimedOut(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
+  if(SAVE_PENDING){pill.textContent='Saving in RivuLog…';pill.className='pill warn';btn.disabled=true;return}
   if(!TANK){pill.textContent='Choose tank in RivuLog';pill.className='pill';btn.disabled=true;return}
-  if(!ARMED){pill.textContent='Saved — choose next tank';pill.className='pill ok';btn.disabled=true;return}
+  if(!ARMED){pill.textContent='Saved in RivuLog ✓ — choose next tank';pill.className='pill ok';btn.disabled=true;return}
   if(!LAST){pill.textContent='Waiting for reading';pill.className='pill';btn.disabled=true;return}
   if(st){
     pill.textContent=LAST.clipped?'Stable / meter limit':'Stable';
@@ -201,10 +204,15 @@ async function connectMeter(){
 }
 function disconnectMeter(write=true){
   try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
+  if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
   stopReadPolling();TARGET_CHAR=null;SERVER=null;resetStabilizeTimer();if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
 }
 function postMeterStatus(status){try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_STATUS',status},'*')}catch(e){}}
 function resetForTank(tankId){
+  if(SAVE_PENDING){
+    try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_TANK_REJECTED',tankId:String(tankId||''),reason:'A measurement is still being saved.'},'*')}catch(e){}
+    return;
+  }
   const previous=LAST;
   stopReadPolling();
   TANK=String(tankId||'');ARMED=!!TANK;HISTORY=[];LAST=null;LAST_PACKET_AT=0;resetStabilizeTimer();
@@ -214,23 +222,50 @@ function resetForTank(tankId){
   document.getElementById('mPH').textContent='—';document.getElementById('mEC').textContent='—';document.getElementById('mECUnit').textContent='µS/cm';document.getElementById('mTDS').textContent='—';document.getElementById('mTemp').textContent='—';
   document.getElementById('saveState').textContent=TANK?'Tank selected. Move the probe to this tank; RivuLog will request fresh readings automatically.':'Choose a tank in RivuLog.';
   updateStable();log(TANK?'Tank changed to '+TANK:'Tank cleared');
+  try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_TANK_ARMED',tankId:TANK},'*')}catch(e){}
   startReadPolling();
 }
 function confirmMeasurement(){
-  if(!ARMED||!TANK||!LAST)return;
+  if(SAVE_PENDING||!ARMED||!TANK||!LAST)return;
   const stable=isStable(),timedOut=stabilizationTimedOut();
   if(!stable&&!timedOut)return;
-  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable,stabilizationTimedOut:timedOut,clipped:LAST.clipped,rawHex:LAST.rawHex};
+  const messageId=newMessageId();
+  const payload={type:'RIVULOG_BLE_MEASUREMENT',messageId,tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable,stabilizationTimedOut:timedOut,clipped:LAST.clipped,rawHex:LAST.rawHex};
   if(window.opener&&!window.opener.closed){
-    document.getElementById('saveState').textContent=timedOut?'Sending measurement back to RivuLog (15s maximum reached)…':'Sending measurement back to RivuLog…';
+    SAVE_PENDING=true;PENDING_MESSAGE_ID=messageId;PENDING_TANK=TANK;stopReadPolling();updateStable();
+    document.getElementById('saveState').textContent=timedOut?'Saving in RivuLog (15s maximum reached)…':'Saving in RivuLog…';
     window.opener.postMessage(payload,'*');
-    ARMED=false;stopReadPolling();resetStabilizeTimer();updateStable();
-    setTimeout(()=>{document.getElementById('saveState').textContent='Measurement sent. Go back to RivuLog and tap the next tank.'},500);
+    if(SAVE_ACK_TIMER)clearTimeout(SAVE_ACK_TIMER);
+    SAVE_ACK_TIMER=setTimeout(()=>{
+      if(!SAVE_PENDING||PENDING_MESSAGE_ID!==messageId)return;
+      SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';SAVE_ACK_TIMER=null;
+      document.getElementById('saveState').textContent='No save confirmation received. The measurement was NOT confirmed saved — press Confirm & Save to retry.';
+      updateStable();startReadPolling();
+    },20000);
   }else{
     navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
   }
 }
-window.addEventListener('message',e=>{if(e.source!==window.opener)return;const msg=e.data||{};if(msg.type==='RIVULOG_SET_TANK')resetForTank(msg.tankId)});
+window.addEventListener('message',e=>{
+  if(e.source!==window.opener)return;
+  const msg=e.data||{};
+  if(msg.type==='RIVULOG_SET_TANK'){resetForTank(msg.tankId);return}
+  if(msg.type==='RIVULOG_MEASUREMENT_ACK'){
+    if(!SAVE_PENDING||String(msg.messageId||'')!==String(PENDING_MESSAGE_ID||''))return;
+    if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}
+    if(msg.ok){
+      const savedTank=PENDING_TANK||TANK;
+      SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';ARMED=false;stopReadPolling();resetStabilizeTimer();updateStable();
+      document.getElementById('saveState').textContent=`Saved in RivuLog ✓ — ${savedTank}. Go back to RivuLog and tap the next tank.`;
+      log('RivuLog confirmed save for '+savedTank);
+    }else{
+      const err=msg.error||'Unknown save error';
+      SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
+      document.getElementById('saveState').textContent='Save failed in RivuLog: '+err+' — press Confirm & Save to retry.';
+      log('SAVE FAILED: '+err);updateStable();startReadPolling();
+    }
+  }
+});
 setTimeout(()=>{try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_READY'},'*')}catch(e){}},0);
 async function copyLog(){try{await navigator.clipboard.writeText(document.getElementById('log').textContent)}catch(e){}}
 function clearLog(){document.getElementById('log').textContent='RivuLog BLE diagnostic log'}
