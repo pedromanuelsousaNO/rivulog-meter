@@ -39,6 +39,7 @@ details summary{cursor:pointer}
     </div>
     <div id="status" class="status" style="margin-top:10px">Not connected.</div>
     <div id="saveState" class="small" style="margin-top:7px"></div>
+    <div class="small" style="margin-top:5px">Stability wait is capped at 15 seconds per tank.</div>
   </div>
 
   <details class="card">
@@ -57,6 +58,8 @@ details summary{cursor:pointer}
 </main>
 <script>
 let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, ARMED=false;
+let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
+const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
 const qs=new URLSearchParams(location.search);
@@ -108,15 +111,37 @@ function isStable(){
   const ecBase=Math.max(1,h[h.length-1].EC_uScm),tdsBase=Math.max(1,h[h.length-1].TDS_ppm);
   return p<=0.04 && t<=0.3 && ec<=Math.max(5,ecBase*.02) && tds<=Math.max(3,tdsBase*.02);
 }
+function stabilizationTimedOut(){return !!(STABILIZE_STARTED_AT && Date.now()-STABILIZE_STARTED_AT>=STABILIZE_MAX_MS)}
+function stopStabilizeTimer(){if(STABILIZE_TIMER){clearInterval(STABILIZE_TIMER);STABILIZE_TIMER=null}}
+function resetStabilizeTimer(){stopStabilizeTimer();STABILIZE_STARTED_AT=0}
+function startStabilizeTimer(){
+  if(STABILIZE_STARTED_AT||!ARMED||!TANK)return;
+  STABILIZE_STARTED_AT=Date.now();
+  STABILIZE_TIMER=setInterval(updateStable,250);
+}
 function updateStable(){
-  const st=isStable(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
+  const st=isStable(),timedOut=stabilizationTimedOut(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
   if(!TANK){pill.textContent='Choose tank in RivuLog';pill.className='pill';btn.disabled=true;return}
   if(!ARMED){pill.textContent='Saved — choose next tank';pill.className='pill ok';btn.disabled=true;return}
   if(!LAST){pill.textContent='Waiting for reading';pill.className='pill';btn.disabled=true;return}
-  if(LAST.clipped){pill.textContent='Stable / meter limit';pill.className='pill warn'}
-  else if(st){pill.textContent='Stable';pill.className='pill ok'}
-  else {pill.textContent='Stabilizing…';pill.className='pill'}
-  btn.disabled=!st;
+  if(st){
+    pill.textContent=LAST.clipped?'Stable / meter limit':'Stable';
+    pill.className=LAST.clipped?'pill warn':'pill ok';
+    btn.disabled=false;
+    return;
+  }
+  if(timedOut){
+    stopStabilizeTimer();
+    pill.textContent='15s max — confirm';
+    pill.className='pill warn';
+    btn.disabled=false;
+    return;
+  }
+  const elapsed=STABILIZE_STARTED_AT?Date.now()-STABILIZE_STARTED_AT:0;
+  const remaining=Math.max(1,Math.ceil((STABILIZE_MAX_MS-elapsed)/1000));
+  pill.textContent=`Stabilizing… ${remaining}s`;
+  pill.className='pill';
+  btn.disabled=true;
 }
 function handlePacket(dv,source='RX'){
   try{
@@ -129,6 +154,7 @@ function handlePacket(dv,source='RX'){
     if(now-LAST_PACKET_AT<350 && LAST && r.pH===LAST.pH && r.EC_uScm===LAST.EC_uScm && r.TDS_ppm===LAST.TDS_ppm && r.Temperature_C===LAST.Temperature_C)return;
     LAST_PACKET_AT=now;
     r.rawHex=hexOf(u8);r.measuredAt=new Date().toISOString();LAST=r;HISTORY.push(r);if(HISTORY.length>20)HISTORY.shift();
+    startStabilizeTimer();
     renderReading(r);updateStable();
     log(`${source} pH=${r.pH.toFixed(2)} EC=${displayEC(r.EC_uScm).value} ${displayEC(r.EC_uScm).unit} TDS=${r.TDS_ppm} ppm T=${r.Temperature_C.toFixed(1)} C`);
     if(r.clipped)document.getElementById('saveState').textContent='EC/TDS are at the verified high-range limit; the true value may be higher.';
@@ -139,7 +165,7 @@ async function connectMeter(){
   try{
     if(!window.isSecureContext)throw new Error('HTTPS secure context is required.');
     if(!navigator.bluetooth)throw new Error('Web Bluetooth is not available. Use desktop Chrome or Edge.');
-    disconnectMeter(false);HISTORY=[];LAST=null;updateStable();document.getElementById('saveState').textContent='';
+    disconnectMeter(false);HISTORY=[];LAST=null;resetStabilizeTimer();updateStable();document.getElementById('saveState').textContent='';
     setStatus('Choose BLE-9908 in the Bluetooth dialog…');
     DEVICE=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
     log(`Device selected: ${DEVICE.name||'(unnamed)'}`);
@@ -153,23 +179,25 @@ async function connectMeter(){
 }
 function disconnectMeter(write=true){
   try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
-  TARGET_CHAR=null;SERVER=null;if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
+  TARGET_CHAR=null;SERVER=null;resetStabilizeTimer();if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
 }
 function postMeterStatus(status){try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_STATUS',status},'*')}catch(e){}}
 function resetForTank(tankId){
-  TANK=String(tankId||'');ARMED=!!TANK;HISTORY=[];LAST=null;LAST_PACKET_AT=0;
+  TANK=String(tankId||'');ARMED=!!TANK;HISTORY=[];LAST=null;LAST_PACKET_AT=0;resetStabilizeTimer();
   document.getElementById('tankLabel').textContent=TANK||'Choose a tank in RivuLog';
   document.getElementById('mPH').textContent='—';document.getElementById('mEC').textContent='—';document.getElementById('mECUnit').textContent='µS/cm';document.getElementById('mTDS').textContent='—';document.getElementById('mTemp').textContent='—';
   document.getElementById('saveState').textContent=TANK?'Tank selected. Put the probe in this tank and wait for a stable reading.':'Choose a tank in RivuLog.';
   updateStable();log(TANK?'Tank changed to '+TANK:'Tank cleared');
 }
 function confirmMeasurement(){
-  if(!ARMED||!TANK||!LAST||!isStable())return;
-  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable:true,clipped:LAST.clipped,rawHex:LAST.rawHex};
+  if(!ARMED||!TANK||!LAST)return;
+  const stable=isStable(),timedOut=stabilizationTimedOut();
+  if(!stable&&!timedOut)return;
+  const payload={type:'RIVULOG_BLE_MEASUREMENT',tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable,stabilizationTimedOut:timedOut,clipped:LAST.clipped,rawHex:LAST.rawHex};
   if(window.opener&&!window.opener.closed){
-    document.getElementById('saveState').textContent='Sending measurement back to RivuLog…';
+    document.getElementById('saveState').textContent=timedOut?'Sending measurement back to RivuLog (15s maximum reached)…':'Sending measurement back to RivuLog…';
     window.opener.postMessage(payload,'*');
-    ARMED=false;updateStable();
+    ARMED=false;resetStabilizeTimer();updateStable();
     setTimeout(()=>{document.getElementById('saveState').textContent='Measurement sent. Go back to RivuLog and tap the next tank.'},500);
   }else{
     navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
