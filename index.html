@@ -22,7 +22,7 @@ details summary{cursor:pointer}
 </style>
 </head>
 <body>
-<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement</div></header>
+<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.1</div></header>
 <main class="wrap">
   <div class="card">
     <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
@@ -59,6 +59,7 @@ details summary{cursor:pointer}
 <script>
 let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, ARMED=false;
 let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
+let READ_POLL_TIMER=null, READ_IN_FLIGHT=false, PREVIOUS_TANK_FINGERPRINT='', SAME_READING_GRACE_UNTIL=0;
 const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
@@ -93,6 +94,7 @@ function decodePacket(u8){
   return {pH:ph,EC_uScm:ec_uScm,TDS_ppm:tds,Temperature_C:temp,ecRaw,highRange:verifiedHigh,clipped:verifiedHigh&&tds>=9990,decoded:d};
 }
 function validReading(r){return r&&r.pH>=0&&r.pH<=14&&r.EC_uScm>=0&&r.TDS_ppm>=0&&r.Temperature_C>=0&&r.Temperature_C<=60}
+function readingFingerprint(r){return r?[r.pH,r.EC_uScm,r.TDS_ppm,r.Temperature_C].join('|'):''}
 function displayEC(v){return v>=10000?{value:(v/1000).toFixed(2),unit:'mS/cm'}:{value:String(Math.round(v)),unit:'µS/cm'}}
 function renderReading(r){
   const ec=displayEC(r.EC_uScm);
@@ -150,6 +152,13 @@ function handlePacket(dv,source='RX'){
     const r=decodePacket(u8);
     if(!validReading(r))return;
     const now=Date.now();
+    const fp=readingFingerprint(r);
+    if(ARMED&&!LAST&&PREVIOUS_TANK_FINGERPRINT&&fp===PREVIOUS_TANK_FINGERPRINT&&now<SAME_READING_GRACE_UNTIL){
+      document.getElementById('stablePill').textContent='Waiting for new tank reading…';
+      document.getElementById('stablePill').className='pill';
+      return;
+    }
+    if(!LAST)PREVIOUS_TANK_FINGERPRINT='';
     // The meter can produce duplicate read+notify events. Keep one decoded sample per 350 ms.
     if(now-LAST_PACKET_AT<350 && LAST && r.pH===LAST.pH && r.EC_uScm===LAST.EC_uScm && r.TDS_ppm===LAST.TDS_ppm && r.Temperature_C===LAST.Temperature_C)return;
     LAST_PACKET_AT=now;
@@ -161,6 +170,18 @@ function handlePacket(dv,source='RX'){
   }catch(e){log('DECODE ERROR: '+e.message)}
 }
 function onValue(e){handlePacket(e.target.value,'NOTIFY')}
+function stopReadPolling(){if(READ_POLL_TIMER){clearInterval(READ_POLL_TIMER);READ_POLL_TIMER=null}READ_IN_FLIGHT=false}
+async function pollReadOnce(){
+  if(READ_IN_FLIGHT||!ARMED||!TANK||!TARGET_CHAR||!DEVICE?.gatt?.connected||!TARGET_CHAR.properties.read)return;
+  READ_IN_FLIGHT=true;
+  try{handlePacket(await TARGET_CHAR.readValue(),'POLL')}catch(e){log('Poll read failed: '+e.message)}finally{READ_IN_FLIGHT=false}
+}
+function startReadPolling(){
+  stopReadPolling();
+  if(!ARMED||!TANK||!TARGET_CHAR||!TARGET_CHAR.properties.read||!DEVICE?.gatt?.connected)return;
+  setTimeout(()=>pollReadOnce(),500);
+  READ_POLL_TIMER=setInterval(()=>pollReadOnce(),1000);
+}
 async function connectMeter(){
   try{
     if(!window.isSecureContext)throw new Error('HTTPS secure context is required.');
@@ -169,25 +190,31 @@ async function connectMeter(){
     setStatus('Choose BLE-9908 in the Bluetooth dialog…');
     DEVICE=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
     log(`Device selected: ${DEVICE.name||'(unnamed)'}`);
-    DEVICE.addEventListener('gattserverdisconnected',()=>{setStatus('Disconnected.','warn');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')});
+    DEVICE.addEventListener('gattserverdisconnected',()=>{stopReadPolling();setStatus('Disconnected.','warn');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')});
     SERVER=await DEVICE.gatt.connect();setStatus('Connected to '+(DEVICE.name||'BLE device'),'ok');postMeterStatus('connected');
     const svc=await SERVER.getPrimaryService(SERVICE);TARGET_CHAR=await svc.getCharacteristic(CHAR);
     log('FF01 / FF02 connected: read='+!!TARGET_CHAR.properties.read+' notify='+!!TARGET_CHAR.properties.notify);
     if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){await TARGET_CHAR.startNotifications();TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);log('FF02 notifications started.')}
     if(TARGET_CHAR.properties.read){try{handlePacket(await TARGET_CHAR.readValue(),'READ')}catch(e){log('Initial read failed: '+e.message)}}
+    startReadPolling();
   }catch(e){setStatus('Connection failed: '+e.message,'bad');log('ERROR '+e.name+': '+e.message)}
 }
 function disconnectMeter(write=true){
   try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
-  TARGET_CHAR=null;SERVER=null;resetStabilizeTimer();if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
+  stopReadPolling();TARGET_CHAR=null;SERVER=null;resetStabilizeTimer();if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
 }
 function postMeterStatus(status){try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_STATUS',status},'*')}catch(e){}}
 function resetForTank(tankId){
+  const previous=LAST;
+  stopReadPolling();
   TANK=String(tankId||'');ARMED=!!TANK;HISTORY=[];LAST=null;LAST_PACKET_AT=0;resetStabilizeTimer();
+  PREVIOUS_TANK_FINGERPRINT=readingFingerprint(previous);
+  SAME_READING_GRACE_UNTIL=Date.now()+2500;
   document.getElementById('tankLabel').textContent=TANK||'Choose a tank in RivuLog';
   document.getElementById('mPH').textContent='—';document.getElementById('mEC').textContent='—';document.getElementById('mECUnit').textContent='µS/cm';document.getElementById('mTDS').textContent='—';document.getElementById('mTemp').textContent='—';
-  document.getElementById('saveState').textContent=TANK?'Tank selected. Put the probe in this tank and wait for a stable reading.':'Choose a tank in RivuLog.';
+  document.getElementById('saveState').textContent=TANK?'Tank selected. Move the probe to this tank; RivuLog will request fresh readings automatically.':'Choose a tank in RivuLog.';
   updateStable();log(TANK?'Tank changed to '+TANK:'Tank cleared');
+  startReadPolling();
 }
 function confirmMeasurement(){
   if(!ARMED||!TANK||!LAST)return;
@@ -197,7 +224,7 @@ function confirmMeasurement(){
   if(window.opener&&!window.opener.closed){
     document.getElementById('saveState').textContent=timedOut?'Sending measurement back to RivuLog (15s maximum reached)…':'Sending measurement back to RivuLog…';
     window.opener.postMessage(payload,'*');
-    ARMED=false;resetStabilizeTimer();updateStable();
+    ARMED=false;stopReadPolling();resetStabilizeTimer();updateStable();
     setTimeout(()=>{document.getElementById('saveState').textContent='Measurement sent. Go back to RivuLog and tap the next tank.'},500);
   }else{
     navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
