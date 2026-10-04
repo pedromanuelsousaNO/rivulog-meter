@@ -22,7 +22,7 @@ details summary{cursor:pointer}
 </style>
 </head>
 <body>
-<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.2</div></header>
+<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.3</div></header>
 <main class="wrap">
   <div class="card">
     <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
@@ -60,7 +60,7 @@ details summary{cursor:pointer}
 let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACKET_AT=0, ARMED=false;
 let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
 let READ_POLL_TIMER=null, READ_IN_FLIGHT=false, PREVIOUS_TANK_FINGERPRINT='', SAME_READING_GRACE_UNTIL=0;
-let SAVE_PENDING=false, PENDING_MESSAGE_ID='', PENDING_TANK='';
+let SAVE_PENDING=false, PENDING_MESSAGE_ID='', PENDING_TANK='', SAVE_ACK_TIMER=null;
 const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
