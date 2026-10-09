@@ -22,7 +22,7 @@ details summary{cursor:pointer}
 </style>
 </head>
 <body>
-<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.3</div></header>
+<header><div class="brand">RivuLog Meter</div><div class="tagline">BLE-9908 live water measurement • v2.1.4</div></header>
 <main class="wrap">
   <div class="card">
     <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
@@ -61,6 +61,7 @@ let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACK
 let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
 let READ_POLL_TIMER=null, READ_IN_FLIGHT=false, PREVIOUS_TANK_FINGERPRINT='', SAME_READING_GRACE_UNTIL=0;
 let SAVE_PENDING=false, PENDING_MESSAGE_ID='', PENDING_TANK='', SAVE_ACK_TIMER=null;
+const VOICE_CAPTURE_REQUESTS=new Set();
 const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
 const CHAR='0000ff02-0000-1000-8000-00805f9b34fb';
@@ -246,9 +247,34 @@ function confirmMeasurement(){
     navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
   }
 }
+function replyCapture(requestId,ok,reason='',messageId=''){
+  try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_CAPTURE_RESULT',requestId:String(requestId||''),ok:!!ok,reason:String(reason||''),messageId:String(messageId||'')},'*')}catch(e){}
+}
+function handleVoiceCapture(msg){
+  const requestId=String(msg.requestId||'');
+  const expectedTank=String(msg.tankId||'');
+  if(!requestId||VOICE_CAPTURE_REQUESTS.has(requestId))return;
+  VOICE_CAPTURE_REQUESTS.add(requestId);
+  if(VOICE_CAPTURE_REQUESTS.size>50)VOICE_CAPTURE_REQUESTS.delete(VOICE_CAPTURE_REQUESTS.values().next().value);
+  const refuse=reason=>{log('VOICE CAPTURE BLOCKED: '+reason);document.getElementById('saveState').textContent=reason;replyCapture(requestId,false,reason)};
+  if(SAVE_PENDING)return refuse('A measurement is already being saved.');
+  if(!DEVICE?.gatt?.connected||!TARGET_CHAR)return refuse('The Bluetooth meter is disconnected.');
+  if(!ARMED||!TANK||expectedTank!==String(TANK))return refuse('The meter is not armed for the selected tank.');
+  if(!LAST||!validReading(LAST))return refuse('No valid BLE measurement is available yet.');
+  const ageMs=Date.now()-Date.parse(LAST.measuredAt||'');
+  if(!Number.isFinite(ageMs)||ageMs<0||ageMs>4000)return refuse('The last measurement is stale. Wait for a fresh reading.');
+  if(!isStable()&&!stabilizationTimedOut())return refuse('The reading is still stabilizing. Wait up to 15 seconds.');
+  log('VOICE CAPTURE: Confirm & Save requested for '+TANK);
+  confirmMeasurement();
+  if(!SAVE_PENDING)return refuse('The meter could not start saving this reading.');
+  document.getElementById('saveState').textContent='Voice save requested. Waiting for RivuLog database confirmation…';
+  replyCapture(requestId,true,'Saving in RivuLog',PENDING_MESSAGE_ID);
+  // This acknowledges capture initiation, not successful database saving.
+}
 window.addEventListener('message',e=>{
   if(e.source!==window.opener)return;
   const msg=e.data||{};
+  if(msg.type==='RIVULOG_CAPTURE_REQUEST'){handleVoiceCapture(msg);return}
   if(msg.type==='RIVULOG_SET_TANK'){resetForTank(msg.tankId);return}
   if(msg.type==='RIVULOG_MEASUREMENT_ACK'){
     if(!SAVE_PENDING||String(msg.messageId||'')!==String(PENDING_MESSAGE_ID||''))return;
