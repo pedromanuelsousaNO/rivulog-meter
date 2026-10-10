@@ -38,11 +38,11 @@ body{max-width:1740px;margin:0 auto;padding:22px 25px}
 @media(min-width:961px){.testGrid .testingVoice>section{height:100%}}
 </style></head>
 <body>
-<header class="apphead"><div><h1>🐟 RivuLog Testing Console</h1><div class="subtitle">Live BLE water measurements + hands-free voice controls</div></div><span class="version">Console V5.4.0 · BLE-9908 v2.1.4</span></header>
+<header class="apphead"><div><h1>🐟 RivuLog Testing Console</h1><div class="subtitle">Live BLE water measurements + hands-free voice controls</div></div><span class="version">Console V5.4.2 · BLE reconnect + dated recommendations</span></header>
 <div class="testGrid">
  <div class="testingMeter">
    <button id="sessionButton" type="button" onclick="startTestingSession()">▶ Start testing · meter + microphone</button>
-   <p class="sessionHelp">One session button requests Bluetooth and starts voice recognition. If the browser requires separate permission, use the Connect meter / Start listening buttons below.</p>
+   <p class="sessionHelp">One session button connects the previously approved meter when possible, or requests Bluetooth, and starts voice recognition. If the browser requires separate permission, use the Connect meter / Start listening buttons below.</p>
    <div id="meterPanel">
   <div class="card">
     <div class="between"><div><div class="small">Tank</div><b id="tankLabel">—</b></div><span id="stablePill" class="pill">Waiting for reading</span></div>
@@ -53,7 +53,8 @@ body{max-width:1740px;margin:0 auto;padding:22px 25px}
       <div class="metric"><span>Temperature</span><b id="mTemp">—</b><span>°C</span></div>
     </div>
     <div class="row" style="margin-top:14px">
-      <button id="connectBtn" class="primary" onclick="connectMeter()">Connect meter</button>
+      <button id="connectBtn" class="primary" onclick="connectMeter()">Connect / Reconnect meter</button>
+      <button id="chooseMeterBtn" onclick="connectMeter(true)">Choose meter…</button>
       <button id="confirmBtn" class="primary" disabled onclick="confirmMeasurement()">Confirm &amp; Save</button>
       <button onclick="disconnectMeter()">Disconnect</button>
     </div>
@@ -237,17 +238,43 @@ function showDeletePrompt(m){
 }
 
 function safe(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function drawTrends(m){$('trends').hidden=false;$('trendtitle').textContent='Tank '+(m.tank??'?')+' · water trends';
- if(m.loading){$('trendinfo').textContent='Loading historical measurements…';$('trendgrid').innerHTML='';return}
- if(m.error){$('trendinfo').textContent='Unable to load water history: '+m.error;$('trendgrid').innerHTML='';return}
- $('trendinfo').textContent=(m.shared?'Shared incubator water (#44–#50) · ':'')+(m.days?m.days+' days':'All history')+' · separate scale per parameter';
+function drawTrends(m){
+ $('trends').hidden=false;
+ $('trendtitle').textContent=(language==='pt-PT'?'Aquário ':'Tank ')+(m.tank??'?')+' · '+tr('water trends','gráficos da água');
+ if(m.loading){$('trendinfo').textContent=tr('Loading historical measurements…','A carregar medições históricas…');$('trendgrid').innerHTML='';return}
+ if(m.error){$('trendinfo').textContent=tr('Unable to load water history: ','Não foi possível carregar o histórico: ')+m.error;$('trendgrid').innerHTML='';return}
+ $('trendinfo').textContent=(m.shared?'Shared incubator water (#44–#50) · ':'')+(m.days?m.days+' days':'All history')+' · '+tr('light green = recorded recommended range, effective from stocking date','verde-claro = intervalo recomendado desde a data de introdução dos peixes');
  const defs=[['pH','pH',''],['EC_uScm','Conductivity','µS/cm'],['TDS_ppm','TDS','ppm'],['Temperature_C','Temperature','°C']];
- $('trendgrid').innerHTML=defs.map(([k,label,unit])=>{const data=(m.series?.[k]||[]).filter(a=>Number.isFinite(Number(a.value)));if(!data.length)return '<div class="trendbox"><h3>'+safe(label)+'</h3><div class="muted">No saved readings</div></div>';
- const vals=data.map(a=>Number(a.value)),lo=Math.min(...vals),hi=Math.max(...vals),pad=(hi-lo||Math.abs(hi)*.05||1)*.13,min=lo-pad,max=hi+pad;
- const pts=data.map((a,i)=>{const x=38+(data.length===1?150:i/(data.length-1)*300),y=155-(Number(a.value)-min)/(max-min)*120;return [x,y]});
- const path=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
- const dateTxt=x=>{let d=String(x||'');return d.length>=10?d.slice(0,10):d};
- return '<div class="trendbox"><h3>'+safe(label)+'</h3><div class="muted">Latest: '+vals.at(-1).toFixed(2)+' '+safe(unit)+' · '+data.length+' readings</div><svg viewBox="0 0 360 190" role="img" aria-label="'+safe(label)+' historical trend"><path d="M38 35V155H340" fill="none" stroke="#436970" stroke-width="1"/><path d="'+path+'" fill="none" stroke="#4fd1c5" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'+pts.map(p=>'<circle cx="'+p[0]+'" cy="'+p[1]+'" r="2" fill="#4fd1c5"/>').join('')+'<g fill="#a5c6c3" font-size="11"><text x="2" y="38">'+max.toFixed(1)+'</text><text x="2" y="154">'+min.toFixed(1)+'</text><text x="38" y="177">'+safe(dateTxt(data[0].date))+'</text><text x="340" y="177" text-anchor="end">'+safe(dateTxt(data.at(-1).date))+'</text></g></svg></div>'}).join('');
+ $('trendgrid').innerHTML=defs.map(([k,label,unit])=>{
+  const data=(m.series?.[k]||[]).filter(a=>Number.isFinite(Number(a.value)));
+  if(!data.length)return '<div class="trendbox"><h3>'+safe(label)+'</h3><div class="muted">'+tr('No saved readings','Sem leituras guardadas')+'</div></div>';
+  const bands=(m.recommendedBands?.[k]||[]).filter(x=>Number.isFinite(Number(x.min))&&Number.isFinite(Number(x.max)));
+  const vals=data.map(a=>Number(a.value)),allVals=vals.concat(bands.flatMap(b=>[Number(b.min),Number(b.max)]));
+  const lo=Math.min(...allVals),hi=Math.max(...allVals),pad=(hi-lo||Math.abs(hi)*.05||1)*.13,min=lo-pad,max=hi+pad;
+  const times=data.map(a=>new Date(a.date).getTime());
+  const xidx=i=>38+(data.length===1?150:i/(data.length-1)*300);
+  const xdate=t=>{
+   if(data.length===1)return xidx(0);
+   if(t<=times[0])return xidx(0);
+   if(t>=times.at(-1))return xidx(data.length-1);
+   for(let i=1;i<times.length;i++)if(t<=times[i])return xidx(i-1)+(xidx(i)-xidx(i-1))*(t-times[i-1])/Math.max(1,times[i]-times[i-1]);
+   return xidx(data.length-1);
+  };
+  const yval=v=>155-(v-min)/(max-min)*120;
+  const shaded=bands.map(b=>{
+   const start=new Date(b.from+'T00:00:00').getTime(),end=b.to?new Date(b.to+'T00:00:00').getTime():Infinity;
+   if(!Number.isFinite(start)||times.at(-1)<start||times[0]>=end)return '';
+   const left=xdate(Math.max(times[0],start)),right=xdate(Math.min(times.at(-1),end));
+   if(right<=left)return '';
+   const top=yval(Number(b.max)),bottom=yval(Number(b.min));
+   return '<rect x="'+left.toFixed(1)+'" y="'+Math.min(top,bottom).toFixed(1)+'" width="'+(right-left).toFixed(1)+'" height="'+Math.abs(bottom-top).toFixed(1)+'" fill="#7bd389" fill-opacity="0.25"/>';
+  }).join('');
+  const pts=data.map((a,i)=>[xidx(i),yval(Number(a.value))]);
+  const path=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+  const dateTxt=x=>{let d=String(x||'');return d.length>=10?d.slice(0,10):d};
+  const bandNotice=bands.length?bands.map(b=>b.min+'–'+b.max+' '+unit+' ('+b.from+' → '+(b.to||tr('present','presente'))+')').join(' · '):tr('No recommended occupancy period recorded','Sem intervalo recomendado registado');
+  return '<div class="trendbox"><h3>'+safe(label)+'</h3><div class="muted">'+tr('Latest: ','Última: ')+vals.at(-1).toFixed(2)+' '+safe(unit)+' · '+data.length+' '+tr('readings','leituras')+'</div><svg viewBox="0 0 360 190" role="img" aria-label="'+safe(label)+' historical trend"><path d="M38 35V155H340" fill="none" stroke="#436970" stroke-width="1"/>'+shaded+'<path d="'+path+'" fill="none" stroke="#4fd1c5" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'+pts.map(p=>'<circle cx="'+p[0]+'" cy="'+p[1]+'" r="2" fill="#4fd1c5"/>').join('')+'<g fill="#a5c6c3" font-size="11"><text x="2" y="38">'+max.toFixed(1)+'</text><text x="2" y="154">'+min.toFixed(1)+'</text><text x="38" y="177">'+safe(dateTxt(data[0].date))+'</text><text x="340" y="177" text-anchor="end">'+safe(dateTxt(data.at(-1).date))+'</text></g></svg><small>'+safe(bandNotice)+'</small></div>';
+ }).join('');
  $('trends').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
@@ -262,6 +289,12 @@ let DEVICE=null, SERVER=null, TARGET_CHAR=null, LAST=null, HISTORY=[], LAST_PACK
 let STABILIZE_STARTED_AT=0, STABILIZE_TIMER=null;
 let READ_POLL_TIMER=null, READ_IN_FLIGHT=false, PREVIOUS_TANK_FINGERPRINT='', SAME_READING_GRACE_UNTIL=0;
 let SAVE_PENDING=false, PENDING_MESSAGE_ID='', PENDING_TANK='', SAVE_ACK_TIMER=null;
+// V5.4.1: recover from brief BLE dropouts without touching the save protocol.
+const BLE_DEVICE_KEY='rivulog_ble9908_device_id';
+const BLE_RETRY_DELAYS=[2000,5000,10000];
+const BLE_FRESH_MAX_MS=5000;
+let BLE_CONNECTING=false, BLE_MANUAL_STOP=false, BLE_RETRY_TIMER=null, BLE_RETRIES=0, BLE_BOUND_DEVICE=null;
+
 const VOICE_CAPTURE_REQUESTS=new Set();
 const STABILIZE_MAX_MS=15000;
 const SERVICE='0000ff01-0000-1000-8000-00805f9b34fb';
@@ -331,6 +364,7 @@ function updateStable(){
   if(!TANK){pill.textContent='Choose tank in RivuLog';pill.className='pill';btn.disabled=true;return}
   if(!ARMED){pill.textContent='Saved in RivuLog ✓ — choose next tank';pill.className='pill ok';btn.disabled=true;return}
   if(!LAST){pill.textContent='Waiting for reading';pill.className='pill';btn.disabled=true;return}
+  if(!DEVICE?.gatt?.connected||!TARGET_CHAR||!Number.isFinite(Date.parse(LAST.measuredAt||''))||Date.now()-Date.parse(LAST.measuredAt)>BLE_FRESH_MAX_MS){pill.textContent='Waiting for fresh BLE reading';pill.className='pill warn';btn.disabled=true;return}
   if(st){
     pill.textContent=LAST.clipped?'Stable / meter limit':'Stable';
     pill.className=LAST.clipped?'pill warn':'pill ok';
@@ -387,28 +421,136 @@ function startReadPolling(){
   setTimeout(()=>pollReadOnce(),500);
   READ_POLL_TIMER=setInterval(()=>pollReadOnce(),1000);
 }
-async function connectMeter(){
+// Clear values on disconnect. Never allow an earlier tank's reading to be saved after a reconnect.
+function clearMeterReadings(){
+  LAST=null;HISTORY=[];LAST_PACKET_AT=0;PREVIOUS_TANK_FINGERPRINT='';SAME_READING_GRACE_UNTIL=0;
+  resetStabilizeTimer();
+  for(const id of ['mPH','mEC','mTDS','mTemp'])document.getElementById(id).textContent='—';
+  document.getElementById('mECUnit').textContent='µS/cm';
+  updateStable();
+}
+function cancelBleRetry(){if(BLE_RETRY_TIMER!==null){clearTimeout(BLE_RETRY_TIMER);BLE_RETRY_TIMER=null}}
+function bindMeterDevice(dev){
+  if(BLE_BOUND_DEVICE===dev)return;
+  if(BLE_BOUND_DEVICE)try{BLE_BOUND_DEVICE.removeEventListener('gattserverdisconnected',onMeterDisconnected)}catch(_){}
+  BLE_BOUND_DEVICE=dev;
+  if(dev)dev.addEventListener('gattserverdisconnected',onMeterDisconnected);
+}
+function scheduleBleRetry(){
+  if(BLE_MANUAL_STOP||BLE_RETRY_TIMER!==null||!DEVICE||BLE_RETRIES>=BLE_RETRY_DELAYS.length){
+    if(!BLE_MANUAL_STOP&&DEVICE&&BLE_RETRIES>=BLE_RETRY_DELAYS.length){
+      setStatus('Unable to reconnect. Check that the meter is ON, then click Connect / Reconnect meter.','warn');
+      log('Automatic reconnection paused after three attempts.');
+    }
+    return;
+  }
+  const delay=BLE_RETRY_DELAYS[BLE_RETRIES++];
+  setStatus(`Meter disconnected. Reconnecting ${BLE_RETRIES}/${BLE_RETRY_DELAYS.length} in ${Math.round(delay/1000)}s…`,'warn');
+  log(`Reconnection attempt ${BLE_RETRIES} scheduled in ${delay} ms`);
+  BLE_RETRY_TIMER=setTimeout(()=>{
+    BLE_RETRY_TIMER=null;
+    if(!BLE_MANUAL_STOP&&(!DEVICE?.gatt?.connected||!TARGET_CHAR))void connectMeter(false,true);
+  },delay);
+}
+function onMeterDisconnected(event){
+  // Ignore late disconnect events from a different meter the user replaced.
+  if(event?.target&&event.target!==DEVICE)return;
+  stopReadPolling();SERVER=null;TARGET_CHAR=null;
+  clearMeterReadings();
+  document.getElementById('confirmBtn').disabled=true;
+  postMeterStatus('disconnected');
+  if(BLE_MANUAL_STOP){setStatus('Meter disconnected by user.');return}
+  log('Unexpected Bluetooth disconnection; invalidated unsaved readings.');
+  scheduleBleRetry();
+}
+async function connectMeter(forceChooser=false,automaticRetry=false){
+  if(BLE_CONNECTING)return;
+  if(!window.isSecureContext){setStatus('HTTPS secure context is required.','bad');return}
+  if(!navigator.bluetooth){setStatus('Web Bluetooth is unavailable. Use desktop Chrome/Edge.','bad');return}
+  if(DEVICE?.gatt?.connected&&TARGET_CHAR&&!forceChooser){setStatus('Meter is already connected.','ok');return}
+  BLE_MANUAL_STOP=false;
+  cancelBleRetry();
+  if(!automaticRetry)BLE_RETRIES=0;
+  BLE_CONNECTING=true;
+  const connectButton=document.getElementById('connectBtn');
+  const chooseButton=document.getElementById('chooseMeterBtn');
+  connectButton.disabled=true;chooseButton.disabled=true;
   try{
-    if(!window.isSecureContext)throw new Error('HTTPS secure context is required.');
-    if(!navigator.bluetooth)throw new Error('Web Bluetooth is not available. Use desktop Chrome or Edge.');
-    disconnectMeter(false);HISTORY=[];LAST=null;resetStabilizeTimer();updateStable();document.getElementById('saveState').textContent='';
-    setStatus('Choose BLE-9908 in the Bluetooth dialog…');
-    DEVICE=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
-    log(`Device selected: ${DEVICE.name||'(unnamed)'}`);
-    DEVICE.addEventListener('gattserverdisconnected',()=>{stopReadPolling();setStatus('Disconnected.','warn');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')});
-    SERVER=await DEVICE.gatt.connect();setStatus('Connected to '+(DEVICE.name||'BLE device'),'ok');postMeterStatus('connected');
-    const svc=await SERVER.getPrimaryService(SERVICE);TARGET_CHAR=await svc.getCharacteristic(CHAR);
-    log('FF01 / FF02 connected: read='+!!TARGET_CHAR.properties.read+' notify='+!!TARGET_CHAR.properties.notify);
-    if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){await TARGET_CHAR.startNotifications();TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);log('FF02 notifications started.')}
+    if(forceChooser||!DEVICE){
+      // requestDevice must be reached from a user click; never invoke it during automatic retry.
+      if(automaticRetry)throw Error('No previously selected meter available for automatic reconnection.');
+      setStatus('Choose BLE-9908 in the Bluetooth dialog…');
+      const selected=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE,'0000180f-0000-1000-8000-00805f9b34fb','0000180a-0000-1000-8000-00805f9b34fb']});
+      if(DEVICE&&DEVICE!==selected&&DEVICE.gatt?.connected){
+        try{DEVICE.gatt.disconnect()}catch(_){}
+      }
+      DEVICE=selected;
+      bindMeterDevice(DEVICE);
+      try{localStorage.setItem(BLE_DEVICE_KEY,DEVICE.id||'')}catch(_){}
+      log(`Selected meter: ${DEVICE.name||'(unnamed)'}; permission retained by browser when supported.`);
+    }
+    setStatus(automaticRetry?'Reconnecting to BLE-9908…':'Connecting to BLE-9908…');
+    // Remove listeners from the previous characteristic before replacing it.
+    if(TARGET_CHAR)try{TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue)}catch(_){}
+    TARGET_CHAR=null;SERVER=null;
+    clearMeterReadings();
+    bindMeterDevice(DEVICE);
+    SERVER=await DEVICE.gatt.connect();
+    const svc=await SERVER.getPrimaryService(SERVICE);
+    TARGET_CHAR=await svc.getCharacteristic(CHAR);
+    log(`FF01/FF02 connected: read=${!!TARGET_CHAR.properties.read} notify=${!!TARGET_CHAR.properties.notify}`);
+    if(TARGET_CHAR.properties.notify||TARGET_CHAR.properties.indicate){
+      await TARGET_CHAR.startNotifications();
+      TARGET_CHAR.addEventListener('characteristicvaluechanged',onValue);
+    }
+    BLE_RETRIES=0;
+    setStatus('Connected to '+(DEVICE.name||'BLE meter'),'ok');
+    postMeterStatus('connected');
+    document.getElementById('saveState').textContent='Connected. Wait for a new stable reading before saving.';
     if(TARGET_CHAR.properties.read){try{handlePacket(await TARGET_CHAR.readValue(),'READ')}catch(e){log('Initial read failed: '+e.message)}}
     startReadPolling();
-  }catch(e){setStatus('Connection failed: '+e.message,'bad');log('ERROR '+e.name+': '+e.message)}
+  }catch(e){
+    const message=e instanceof Error?e.message:String(e);
+    log('Bluetooth connection error: '+message);
+    if(e?.name==='NotFoundError'&&!automaticRetry){
+      // User dismissed the browser chooser. Do not automatically open it again.
+      setStatus('Device selection cancelled. Click Connect or Choose meter to try again.','warn');
+    }else{
+      setStatus('Connection failed: '+message,'warn');
+      if(DEVICE&&!BLE_MANUAL_STOP)scheduleBleRetry();
+    }
+  }finally{
+    BLE_CONNECTING=false;connectButton.disabled=false;chooseButton.disabled=false;
+  }
 }
 function disconnectMeter(write=true){
-  try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue);if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(e){}
-  if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
-  stopReadPolling();TARGET_CHAR=null;SERVER=null;resetStabilizeTimer();if(write)log('Disconnected.');setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected')
+  BLE_MANUAL_STOP=true;cancelBleRetry();BLE_RETRIES=0;
+  try{if(TARGET_CHAR)TARGET_CHAR.removeEventListener('characteristicvaluechanged',onValue)}catch(_){}
+  stopReadPolling();TARGET_CHAR=null;SERVER=null;
+  try{if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(_){}
+  if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}
+  SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
+  clearMeterReadings();
+  if(write)log('Meter manually disconnected.');
+  setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected');
 }
+// Some Chromium versions can return previously granted Bluetooth devices without a chooser.
+// This is optional; unsupported browsers continue using the normal chooser.
+async function restoreMeterPermission(){
+  if(!navigator.bluetooth?.getDevices)return;
+  let stored='';try{stored=localStorage.getItem(BLE_DEVICE_KEY)||''}catch(_){}
+  if(!stored)return;
+  try{
+    const granted=await navigator.bluetooth.getDevices();
+    const found=granted.find(d=>d.id===stored);
+    if(found&&!DEVICE&&!BLE_CONNECTING){
+      DEVICE=found;bindMeterDevice(DEVICE);
+      log('Previously approved meter restored. Connect / Reconnect can skip the Bluetooth chooser.');
+      setStatus('Previous meter recognized. Click Start testing to connect.');
+    }
+  }catch(e){log('Stored Bluetooth permissions unavailable: '+(e?.message||e))}
+}
+void restoreMeterPermission();
 function postMeterStatus(status){try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_STATUS',status},'*')}catch(e){}}
 function resetForTank(tankId){
   if(SAVE_PENDING){
@@ -429,6 +571,10 @@ function resetForTank(tankId){
 }
 function confirmMeasurement(){
   if(SAVE_PENDING||!ARMED||!TANK||!LAST)return;
+  if(!DEVICE?.gatt?.connected||!TARGET_CHAR||Date.now()-Date.parse(LAST.measuredAt||'')>BLE_FRESH_MAX_MS){
+    document.getElementById('saveState').textContent='Cannot save: BLE data is disconnected or stale. Wait for a fresh reading.';
+    updateStable();return;
+  }
   const stable=isStable(),timedOut=stabilizationTimedOut();
   if(!stable&&!timedOut)return;
   const messageId=newMessageId();
