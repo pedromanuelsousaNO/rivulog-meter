@@ -79,7 +79,7 @@ body{max-width:1740px;margin:0 auto;padding:22px 25px}
 </div>
  </div>
  <div class="testingVoice">
-<section><div class="muted">Connection</div><div id="connection" class="status">Waiting for RivuLog…</div><div class="langrow"><label for="language">Recognition language</label><select id="language"><option value="pt-PT">🇵🇹 Português (Portugal)</option><option value="en-GB">🇬🇧 English (UK)</option><option value="en-US">🇺🇸 English (US)</option></select></div><div id="status" class="status">Microphone is off</div><div class="buttons"><button class="primary" id="start">Start listening</button><button id="stop" disabled>Stop</button></div><div class="muted">Last heard</div><div id="heard" class="tank">—</div><div id="result" class="status muted">Say a command after connecting.</div><small>Use Chrome or Edge. Connect the meter and start listening once; all four live measurements remain visible here.</small></section></div>
+<section><div class="muted">Connection</div><div id="connection" class="status">Waiting for RivuLog…</div><div id="voiceSelectedTank" class="muted">Main application selection not confirmed</div><div class="langrow"><label for="language">Recognition language</label><select id="language"><option value="pt-PT">🇵🇹 Português (Portugal)</option><option value="en-GB">🇬🇧 English (UK)</option><option value="en-US">🇺🇸 English (US)</option></select></div><div id="status" class="status">Microphone is off</div><div class="buttons"><button class="primary" id="start">Start listening</button><button id="stop" disabled>Stop</button></div><div class="muted">Last heard</div><div id="heard" class="tank">—</div><div id="result" class="status muted">Say a command after connecting.</div><small>Use Chrome or Edge. Connect the meter and start listening once; all four live measurements remain visible here.</small></section></div>
 </div>
 <details id="diagnostics" class="consoleDetails" open><summary>Histórico de comandos / Command history</summary><div class="detailsInner"><div class="trendhead"><h2 id="diagtitle">Histórico de comandos</h2><button id="cleardiag" type="button">Limpar</button></div><small id="diagnote">As últimas 12 tentativas de reconhecimento, apenas nesta janela.</small><div class="diaghist" id="diaghist" aria-live="polite"></div></div></details>
 <section id="deletePrompt" hidden aria-live="polite"><h2 id="deleteTitle">Confirm deletion</h2><div id="deleteDetails" class="delete-values"></div><div id="deleteInstructions" class="delete-hint"></div><div class="delete-actions"><button id="deleteConfirm" class="danger" type="button">Confirm deletion</button><button id="deleteCancel" class="safe" type="button">Cancel</button></div><small id="deleteExpiry"></small></section><section id="trends" hidden><div class="trendhead"><h2 id="trendtitle">Water trends</h2><button id="hidetrend">Hide trends</button></div><div id="trendinfo" class="trendsub">Loading…</div><div class="trendgrid" id="trendgrid"></div></section><details class="consoleDetails"><summary>Comandos disponíveis / Available commands</summary><div class="detailsInner"><h2 id="commandtitle">Comandos de voz / Voice commands</h2><table id="commandtable"></table><small id="commandnote">Say one command at a time. Switch language above before speaking.</small></div></details>
@@ -88,7 +88,7 @@ body{max-width:1740px;margin:0 auto;padding:22px 25px}
 
 (()=>{'use strict';
 const $=id=>document.getElementById(id), SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-let hostOrigin=null,token=null,recognition=null,active=false,speaking=false,connected=false,seq=0,deletePrompt=null;const diag=[];
+let hostOrigin=null,token=null,recognition=null,active=false,speaking=false,connected=false,seq=0,deletePrompt=null;let voiceState="Microphone off",voiceEpoch=0,restartTimer=null,voiceClosed=false,voiceStarting=false,voiceRunning=false,lastNavigationId=null;const diag=[];
 const LANGUAGE_KEY="rivulog_voice_lang_v533";let language="pt-PT";try{language=localStorage.getItem(LANGUAGE_KEY)||"pt-PT"}catch(e){}if(!["pt-PT","en-GB","en-US"].includes(language))language="pt-PT";$("language").value=language;
 const pt=()=>language==='pt-PT';const tr=(en,port)=>pt()?port:en;
 const sayStatus=s=>{$('status').textContent=s};
@@ -103,7 +103,8 @@ function logDiag(heard,command,state,id){diag.unshift({heard:String(heard||'—'
 function updateDiag(id,state){const x=diag.find(x=>x.id===id);if(x){x.state=String(state||'');renderDiag()}}
 $('cleardiag').onclick=()=>{diag.length=0;renderDiag()};
 function renderCommands(){ $('commandtitle').textContent=tr('Voice commands','Comandos de voz');$('commandtable').innerHTML=phrases.map(p=>'<tr><td>'+ (pt()?p[1]:p[0])+'</td><td>'+(pt()?p[0]:p[1])+'</td></tr>').join('');$('commandnote').textContent=tr('Say one command at a time. You can change the language above.','Diz um comando de cada vez. Podes mudar a língua acima.');}
-$('language').addEventListener('change',()=>{language=$('language').value;try{localStorage.setItem(LANGUAGE_KEY,language)}catch(e){}renderCommands();renderDiag();if(active){try{recognition?.abort()}catch(e){}recognition=null;active=false;$('start').disabled=false;$('stop').disabled=true;sayStatus(tr('Language changed. Click Start listening.','Língua alterada. Clica em Iniciar escuta.'));}else sayStatus(tr('Language selected. Click Start listening.','Língua selecionada. Clica em Iniciar escuta.'));});renderCommands();renderDiag();
+$('language').addEventListener('change',()=>{const wasActive=active;language=$('language').value;try{localStorage.setItem(LANGUAGE_KEY,language)}catch(e){}renderCommands();renderDiag();if(wasActive)stop();else voiceStateSet('Microphone off');});renderCommands();renderDiag();
+function showMainSelection(id){const n=$('voiceSelectedTank');n.textContent=id?tr('Main application selected tank: ','Aquário selecionado na aplicação: ')+String(id):tr('Main application selection not confirmed','Seleção na aplicação não confirmada');}
 function signal(type,extra={}){if(!window.opener||!connected||!hostOrigin||!token)return;window.opener.postMessage({type,token,...extra},hostOrigin)}
 function hello(){if(!window.opener){$('connection').textContent=tr('Open this window from RivuLog.','Abre esta janela a partir do RivuLog.');return}window.opener.postMessage({type:'RV_VOICE_HELLO'},'*')}
 function localizeReply(message){
@@ -204,9 +205,12 @@ function parse(text){const s=normalize(text);
  if(/^(save|save reading|save measurement|guardar|guarda|guardar leitura|guardar a leitura|guarda leitura|guarda a leitura|guardar a medicao|guardar o teste|gravar|gravar leitura|salvar|registar leitura)$/.test(s))return{command:'save'};
  return{command:'unknown'}
 }
-function stop(){active=false;try{recognition?.abort()}catch(e){}try{speechSynthesis.cancel()}catch(e){}$('start').disabled=false;$('stop').disabled=true;sayStatus(tr('Microphone is off','Microfone desligado'));signal('RV_VOICE_STATUS',{status:'Voice window open — microphone stopped.'})}
-function restart(){if(!active||speaking||!connected||!recognition)return;try{recognition.start()}catch(e){sayStatus(tr('Restarting speech recognition…','A reiniciar reconhecimento de voz…'))}}
-function start(){if(!connected){sayStatus(tr('Waiting for RivuLog connection. Open this page from RivuLog.','À espera da ligação ao RivuLog. Abre esta janela a partir do RivuLog.'));return}if(!window.isSecureContext){sayStatus(tr('HTTPS secure context is required.','É necessária uma ligação HTTPS segura.'));return}if(!SR){sayStatus(tr('Speech recognition unavailable. Please use Chrome or Edge.','Reconhecimento de voz indisponível. Usa o Chrome ou Edge.'));return}if(active)return;recognition=new SR();recognition.lang=language;recognition.continuous=false;recognition.interimResults=false;recognition.maxAlternatives=3;active=true;$('start').disabled=true;$('stop').disabled=false;recognition.onstart=()=>{sayStatus(tr('● Listening — say Next tank','● A ouvir — diz Próximo aquário'));signal('RV_VOICE_STATUS',{status:'● Listening for commands'})};recognition.onerror=e=>{sayStatus(tr('Recognition error: ','Erro de reconhecimento: ')+e.error);if(['not-allowed','service-not-allowed','audio-capture'].includes(e.error))stop()};recognition.onend=()=>{if(active&&!speaking)setTimeout(restart,700)};recognition.onresult=e=>{const choices=Array.from(e.results[e.results.length-1]).map(x=>x.transcript);const heard=choices[0];$('heard').textContent=heard;const parsed=choices.map(parse).find(x=>x.command!=='unknown'&&(x.command!=='tank'||Number.isFinite(x.tank)))||parse(heard);if(parsed.command==='stop'){logDiag(heard,'stop',tr('Executed','Executado'));stop();return}if(parsed.command==='close'){logDiag(heard,'close',tr('Executed','Executado'));stop();window.close();$('result').textContent=tr('Close this tab manually if the browser blocked automatic closing.','Fecha esta janela manualmente se o navegador impediu o fecho automático.');return}if(parsed.command==='unknown'||(parsed.command==='tank'&&!Number.isFinite(parsed.tank))){$('result').textContent=tr('Command not understood','Comando não reconhecido');logDiag(heard,'unknown',tr('Not recognized','Não reconhecido'));speak('Command not understood.');return}if(parsed.command==='hideTrend')hideTrends();if(parsed.command==='confirmDelete'&&!deletePrompt){$('result').textContent=tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.');logDiag(heard,'confirmDelete',tr('Rejected','Recusado'));speak(tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.'));return}const commandId=++seq;logDiag(heard,parsed.command+(parsed.command==='tank'?' '+parsed.tank:''),tr('Sent to RivuLog','Enviado ao RivuLog'),commandId);signal('RV_VOICE_CMD',{...parsed,heard,commandId,...(parsed.command==='confirmDelete'?{deleteToken:deletePrompt.deleteToken}:{})});$('result').textContent=tr('Waiting for RivuLog…','À espera do RivuLog…')};restart()}
+function voiceStateSet(state,detail){voiceState=state;$('status').textContent=tr(state,state==='Listening'?'A ouvir':state==='Stopping'?'A parar':state==='Microphone off'?'Microfone desligado':'Erro')+(detail?' — '+detail:'');$('status').dataset.voiceState=state;$('start').disabled=state==='Listening'||state==='Stopping';$('stop').disabled=state!=='Listening';}
+function cancelVoiceRestart(){if(restartTimer!==null){clearTimeout(restartTimer);restartTimer=null;}}
+function stop(){active=false;cancelVoiceRestart();const old=recognition,awaitEnd=voiceStarting||voiceRunning,ticket=++voiceEpoch;recognition=null;voiceStarting=false;voiceRunning=false;if(old){voiceStateSet(awaitEnd?'Stopping':'Microphone off');old.onend=()=>{if(voiceEpoch===ticket&&voiceState==='Stopping')voiceStateSet('Microphone off');};try{old.abort()}catch(e){voiceStateSet('Error',String(e.message||e))}}else voiceStateSet('Microphone off');try{speechSynthesis.cancel()}catch(e){}signal('RV_VOICE_STATUS',{status:'Voice microphone stop requested.'});}
+function voiceError(e){active=false;cancelVoiceRestart();const old=recognition;++voiceEpoch;recognition=null;voiceStarting=false;voiceRunning=false;voiceStateSet('Error',String(e?.error||e?.message||e));try{old?.abort()}catch(ignore){}}
+function restart(){if(!active||voiceClosed||speaking||!connected||!recognition||voiceStarting||voiceRunning)return;try{voiceStarting=true;recognition.start()}catch(e){voiceError(e)}}
+function start(){if(voiceClosed||voiceState==='Stopping'||active)return;if(!connected){voiceStateSet('Error',tr('Open this page from RivuLog.','Abre esta janela a partir do RivuLog.'));return}if(!window.isSecureContext||!SR){voiceStateSet('Error',tr('Secure Chrome/Edge speech recognition required.','É necessário reconhecimento de voz seguro no Chrome/Edge.'));return}const session=new SR(),epoch=++voiceEpoch;recognition=session;active=true;session.lang=language;session.continuous=false;session.interimResults=false;session.maxAlternatives=3;const valid=()=>!voiceClosed&&active&&recognition===session&&voiceEpoch===epoch;voiceStateSet('Listening',tr('Starting microphone','A iniciar microfone'));session.onstart=()=>{if(!valid())return;voiceStarting=false;voiceRunning=true;voiceStateSet('Listening',tr('Say Next tank','Diz Próximo aquário'));signal('RV_VOICE_STATUS',{status:'Listening for commands'});};session.onerror=e=>{if(valid())voiceError(e);};session.onend=()=>{if(!valid())return;voiceStarting=false;voiceRunning=false;if(speaking)return;cancelVoiceRestart();restartTimer=setTimeout(()=>{restartTimer=null;if(valid())restart()},700);};session.onresult=e=>{if(!valid())return;const choices=Array.from(e.results[e.results.length-1]).map(x=>x.transcript);const heard=choices[0];$('heard').textContent=heard;const parsed=choices.map(parse).find(x=>x.command!=='unknown'&&(x.command!=='tank'||Number.isFinite(x.tank)))||parse(heard);if(parsed.command==='stop'){logDiag(heard,'stop',tr('Executed','Executado'));stop();return}if(parsed.command==='close'){logDiag(heard,'close',tr('Executed','Executado'));stop();window.close();$('result').textContent=tr('Close this tab manually if the browser blocked automatic closing.','Fecha esta janela manualmente se o navegador impediu o fecho automático.');return}if(parsed.command==='unknown'||(parsed.command==='tank'&&!Number.isFinite(parsed.tank))){$('result').textContent=tr('Command not understood','Comando não reconhecido');logDiag(heard,'unknown',tr('Not recognized','Não reconhecido'));speak('Command not understood.');return}if(parsed.command==='hideTrend')hideTrends();if(parsed.command==='confirmDelete'&&!deletePrompt){$('result').textContent=tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.');logDiag(heard,'confirmDelete',tr('Rejected','Recusado'));speak(tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.'));return}const commandId=++seq;if(['tank','next','previous'].includes(parsed.command))lastNavigationId=commandId;logDiag(heard,parsed.command+(parsed.command==='tank'?' '+parsed.tank:''),tr('Sent to RivuLog','Enviado ao RivuLog'),commandId);signal('RV_VOICE_CMD',{...parsed,heard,commandId,...(parsed.command==='confirmDelete'?{deleteToken:deletePrompt.deleteToken}:{})});$('result').textContent=tr('Waiting for RivuLog…','À espera do RivuLog…')};restart()}
 $('start').onclick=start;$('stop').onclick=stop;window.rivuLogVoiceStart=start;window.rivuLogVoiceStop=stop;$('hidetrend').onclick=()=>{hideTrends();signal('RV_VOICE_CMD',{command:'hideTrend',commandId:++seq,heard:'Hide trend'})};
 function hideTrends(){$('trends').hidden=true}
 function clearDeletePrompt(){deletePrompt=null;$('deletePrompt').hidden=true}
@@ -278,8 +282,8 @@ function drawTrends(m){
  $('trends').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-window.addEventListener('message',e=>{if(e.source!==window.opener)return;const m=e.data||{};if(m.type==='RV_VOICE_INIT'){if(!m.token||!m.pageOrigin||e.origin!==m.pageOrigin)return;if(connected&&(e.origin!==hostOrigin||m.token!==token))return;hostOrigin=e.origin;token=m.token;connected=true;$('connection').textContent=tr('✓ Connected to RivuLog','✓ Ligado ao RivuLog');sayStatus(tr('Connected — click Start listening','Ligado — clica em Iniciar escuta'));return}if(!connected||e.origin!==hostOrigin||m.token!==token)return;if(m.type==='RV_VOICE_TRENDS'){drawTrends(m);return}if(m.type==='RV_VOICE_DELETE_PROMPT'){showDeletePrompt(m);return}if(m.type==='RV_VOICE_DELETE_CLEAR'){clearDeletePrompt();return}if(m.type==='RV_VOICE_DELETE_WORKING'){$('deleteConfirm').disabled=true;$('result').textContent=tr('Deleting selected reading…','A apagar a leitura selecionada…');return}if(m.type==='RV_VOICE_ACK'){const message=String(m.result||'');const localized=localizeReply(message);$('result').textContent=localized||message||tr('Command processed','Comando executado');updateDiag(m.commandId,localized||message||tr('Acknowledged','Confirmado'));if(message)speak(message);else speak(tr('Command processed','Comando executado'));}});
-window.addEventListener('pagehide',stop);hello();setTimeout(()=>{if(!connected)hello()},1200);
+window.addEventListener('message',e=>{if(e.source!==window.opener)return;const m=e.data||{};if(m.type==='RV_VOICE_INIT'){if(!m.token||!m.pageOrigin||e.origin!==m.pageOrigin)return;if(connected&&(e.origin!==hostOrigin||m.token!==token))return;hostOrigin=e.origin;token=m.token;connected=true;showMainSelection(m.selectedTankId);$('connection').textContent=tr('✓ Connected to RivuLog','✓ Ligado ao RivuLog');sayStatus(tr('Connected — click Start listening','Ligado — clica em Iniciar escuta'));return}if(!connected||e.origin!==hostOrigin||m.token!==token)return;if(m.type==='RV_VOICE_TRENDS'){drawTrends(m);return}if(m.type==='RV_VOICE_DELETE_PROMPT'){showDeletePrompt(m);return}if(m.type==='RV_VOICE_DELETE_CLEAR'){clearDeletePrompt();return}if(m.type==='RV_VOICE_DELETE_WORKING'){$('deleteConfirm').disabled=true;$('result').textContent=tr('Deleting selected reading…','A apagar a leitura selecionada…');return}if(m.type==='RV_VOICE_ACK'){if(m.commandId===lastNavigationId){showMainSelection(m.selectedTankId);lastNavigationId=null;}const message=String(m.result||'');const localized=localizeReply(message);$('result').textContent=localized||message||tr('Command processed','Comando executado');updateDiag(m.commandId,localized||message||tr('Acknowledged','Confirmado'));if(message)speak(message);else speak(tr('Command processed','Comando executado'));}});
+window.addEventListener('pagehide',()=>{voiceClosed=true;stop()});hello();setTimeout(()=>{if(!connected)hello()},1200);
 })();
 
 </script>
@@ -303,10 +307,21 @@ const qs=new URLSearchParams(location.search);
 let TANK=qs.get('tank')||'';
 ARMED=!!TANK;
 document.getElementById('tankLabel').textContent=TANK||'Choose a tank in RivuLog';
+// One durable operation owns its original immutable payload until confirmed.
+const RV_INSTANCE=qs.get('instance')||'',RV_HOST=qs.get('hostOrigin')||'';
+const RV_PENDING_KEY='rivulog-meter:PRODUCTION:'+RV_INSTANCE+':measurement-v1';
+let RV_OPERATION=null,RV_STORAGE_ERROR='';
+function rvOperationValid(o){const p=o?.payload;return o?.version===1&&['PENDING','COMPLETE','CONFLICT'].includes(o.state)&&o.instance===RV_INSTANCE&&o.hostOrigin===RV_HOST&&p?.type==='RIVULOG_BLE_MEASUREMENT'&&/^[A-Za-z0-9_-]{16,100}$/.test(p.messageId||'')&&p.OperationID===p.messageId&&typeof p.tankId==='string'&&p.tankId.length>0&&typeof p.measuredAt==='string'&&Number.isFinite(Date.parse(p.measuredAt))&&['pH','EC_uScm','TDS_ppm','Temperature_C'].every(k=>typeof p[k]==='number'&&Number.isFinite(p[k]))&&['stable','stabilizationTimedOut','clipped'].every(k=>typeof p[k]==='boolean')&&typeof p.rawHex==='string'&&validReading(p)&&Object.keys(p).every(k=>['type','messageId','OperationID','tankId','measuredAt','pH','EC_uScm','TDS_ppm','Temperature_C','stable','stabilizationTimedOut','clipped','rawHex'].includes(k));}
+function rvFreezeOperation(o){const copy=JSON.parse(JSON.stringify(o));Object.freeze(copy.payload);return Object.freeze(copy);}
+function rvStoreOperation(o){if(!rvOperationValid(o))throw Error('Invalid original operation evidence. Nothing was sent.');const before=localStorage.getItem(RV_PENDING_KEY);if(before){const existing=JSON.parse(before);if(!rvOperationValid(existing))throw Error('Existing recovery evidence is invalid; preserve it.');if(existing.payload.messageId===o.payload.messageId&&JSON.stringify(existing.payload)!==JSON.stringify(o.payload))throw Error('Original measurement data cannot be altered.');if(existing.state!=='COMPLETE'&&existing.payload.messageId!==o.payload.messageId)throw Error('Another window has an unresolved operation; reopen and recover it.');}const text=JSON.stringify(o);localStorage.setItem(RV_PENDING_KEY,text);if(localStorage.getItem(RV_PENDING_KEY)!==text)throw Error('Recovery storage did not retain operation. Nothing was sent.');RV_OPERATION=rvFreezeOperation(o);}
+function rvRestoreOperation(){try{if(qs.get('environment')!=='PRODUCTION'||!RV_INSTANCE||!/^https:\/\//.test(RV_HOST))throw Error('Open the meter from the reviewed PRODUCTION application; recovery identity is missing.');const raw=localStorage.getItem(RV_PENDING_KEY);if(!raw)return;const o=JSON.parse(raw);if(!rvOperationValid(o))throw Error('Stored measurement evidence is invalid; preserve it for review.');RV_OPERATION=rvFreezeOperation(o);TANK=o.payload.tankId;PENDING_TANK=TANK;PENDING_MESSAGE_ID=o.payload.messageId;ARMED=o.state!=='COMPLETE';document.getElementById('tankLabel').textContent=TANK;document.getElementById('saveState').textContent=o.state==='COMPLETE'?'Original measurement confirmed saved. Select a tank for a new observation.':'Original save unresolved. Confirm & Save retries its exact ID, values and timestamp.';}catch(e){RV_STORAGE_ERROR=e.message;document.getElementById('saveState').textContent=RV_STORAGE_ERROR;}}
+function rvSendOriginal(){try{if(RV_STORAGE_ERROR)throw Error(RV_STORAGE_ERROR);if(!RV_OPERATION||RV_OPERATION.state!=='PENDING')throw Error('Original operation requires review.');if(JSON.stringify(JSON.parse(localStorage.getItem(RV_PENDING_KEY)))!==JSON.stringify(RV_OPERATION))throw Error('Stored operation changed or became unavailable; preserve evidence.');if(!window.opener||window.opener.closed)throw Error('Reopen from the same RivuLog application to retry the original save.');const payload=RV_OPERATION.payload;SAVE_PENDING=true;PENDING_MESSAGE_ID=payload.messageId;PENDING_TANK=payload.tankId;stopReadPolling();updateStable();document.getElementById('saveState').textContent='Saving original measurement in RivuLog…';if(SAVE_ACK_TIMER)clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=setTimeout(()=>{SAVE_ACK_TIMER=null;SAVE_PENDING=false;document.getElementById('saveState').textContent='Save outcome uncertain. Confirm & Save retries the ORIGINAL measurement; do not create a replacement.';updateStable();},20000);window.opener.postMessage(JSON.parse(JSON.stringify(payload)),RV_HOST);}catch(e){SAVE_PENDING=false;document.getElementById('saveState').textContent=e.message;updateStable();}}
+rvRestoreOperation();
+
 
 function setStatus(t,cls=''){const e=document.getElementById('meterStatus');e.textContent=t;e.className='status '+cls}
 function log(t){const e=document.getElementById('log');e.textContent+='\n'+new Date().toLocaleTimeString()+' '+t;e.scrollTop=e.scrollHeight}
-function newMessageId(){return (crypto?.randomUUID?crypto.randomUUID():('m-'+Date.now()+'-'+Math.random().toString(36).slice(2)))}
+function newMessageId(){if(globalThis.crypto?.randomUUID)return crypto.randomUUID();if(!globalThis.crypto?.getRandomValues)throw Error('Secure operation ID generation unavailable. Nothing was sent.');const b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;const h=Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);}
 function hexOf(u8){return [...u8].map(b=>b.toString(16).padStart(2,'0')).join(' ')}
 function u16(a,i){return (a[i]<<8)+a[i+1]}
 function decryptPacket(input){
@@ -360,6 +375,8 @@ function startStabilizeTimer(){
 }
 function updateStable(){
   const st=isStable(),timedOut=stabilizationTimedOut(),pill=document.getElementById('stablePill'),btn=document.getElementById('confirmBtn');
+  if(RV_STORAGE_ERROR){pill.textContent='Recovery blocked — see save status';pill.className='pill warn';btn.disabled=true;return}
+  if(RV_OPERATION&&RV_OPERATION.state!=='COMPLETE'){pill.textContent=SAVE_PENDING?'Saving ORIGINAL measurement…':RV_OPERATION.state==='CONFLICT'?'Conflicting evidence — review required':'Uncertain save — retry ORIGINAL';pill.className='pill warn';btn.disabled=SAVE_PENDING||RV_OPERATION.state==='CONFLICT';return}
   if(SAVE_PENDING){pill.textContent='Saving in RivuLog…';pill.className='pill warn';btn.disabled=true;return}
   if(!TANK){pill.textContent='Choose tank in RivuLog';pill.className='pill';btn.disabled=true;return}
   if(!ARMED){pill.textContent='Saved in RivuLog ✓ — choose next tank';pill.className='pill ok';btn.disabled=true;return}
@@ -529,7 +546,7 @@ function disconnectMeter(write=true){
   stopReadPolling();TARGET_CHAR=null;SERVER=null;
   try{if(DEVICE?.gatt?.connected)DEVICE.gatt.disconnect()}catch(_){}
   if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}
-  SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
+  SAVE_PENDING=false; // Keep the durable operation through disconnect and unload.
   clearMeterReadings();
   if(write)log('Meter manually disconnected.');
   setStatus('Not connected.');document.getElementById('confirmBtn').disabled=true;postMeterStatus('disconnected');
@@ -553,7 +570,7 @@ async function restoreMeterPermission(){
 void restoreMeterPermission();
 function postMeterStatus(status){try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_METER_STATUS',status},'*')}catch(e){}}
 function resetForTank(tankId){
-  if(SAVE_PENDING){
+  if(RV_STORAGE_ERROR||(RV_OPERATION&&RV_OPERATION.state!=='COMPLETE')||SAVE_PENDING){
     try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_TANK_REJECTED',tankId:String(tankId||''),reason:'A measurement is still being saved.'},'*')}catch(e){}
     return;
   }
@@ -570,29 +587,13 @@ function resetForTank(tankId){
   startReadPolling();
 }
 function confirmMeasurement(){
-  if(SAVE_PENDING||!ARMED||!TANK||!LAST)return;
-  if(!DEVICE?.gatt?.connected||!TARGET_CHAR||Date.now()-Date.parse(LAST.measuredAt||'')>BLE_FRESH_MAX_MS){
-    document.getElementById('saveState').textContent='Cannot save: BLE data is disconnected or stale. Wait for a fresh reading.';
-    updateStable();return;
-  }
-  const stable=isStable(),timedOut=stabilizationTimedOut();
-  if(!stable&&!timedOut)return;
-  const messageId=newMessageId();
-  const payload={type:'RIVULOG_BLE_MEASUREMENT',messageId,tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable,stabilizationTimedOut:timedOut,clipped:LAST.clipped,rawHex:LAST.rawHex};
-  if(window.opener&&!window.opener.closed){
-    SAVE_PENDING=true;PENDING_MESSAGE_ID=messageId;PENDING_TANK=TANK;stopReadPolling();updateStable();
-    document.getElementById('saveState').textContent=timedOut?'Saving in RivuLog (15s maximum reached)…':'Saving in RivuLog…';
-    window.opener.postMessage(payload,'*');
-    if(SAVE_ACK_TIMER)clearTimeout(SAVE_ACK_TIMER);
-    SAVE_ACK_TIMER=setTimeout(()=>{
-      if(!SAVE_PENDING||PENDING_MESSAGE_ID!==messageId)return;
-      SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';SAVE_ACK_TIMER=null;
-      document.getElementById('saveState').textContent='No save confirmation received. The measurement was NOT confirmed saved — press Confirm & Save to retry.';
-      updateStable();startReadPolling();
-    },20000);
-  }else{
-    navigator.clipboard?.writeText(JSON.stringify(payload,null,2)).then(()=>document.getElementById('saveState').textContent='No RivuLog opener was found. Measurement JSON copied to clipboard.').catch(()=>document.getElementById('saveState').textContent='Open this meter page from RivuLog before confirming.');
-  }
+  if(SAVE_PENDING)return;
+  if(RV_STORAGE_ERROR){document.getElementById('saveState').textContent=RV_STORAGE_ERROR;return;}
+  if(RV_OPERATION&&RV_OPERATION.state!=='COMPLETE'){rvSendOriginal();return;}
+  if(!ARMED||!TANK||!LAST)return;
+  if(!DEVICE?.gatt?.connected||!TARGET_CHAR||Date.now()-Date.parse(LAST.measuredAt||'')>BLE_FRESH_MAX_MS){document.getElementById('saveState').textContent='Cannot save: BLE data is disconnected or stale. Wait for a fresh reading.';updateStable();return;}
+  const stable=isStable(),timedOut=stabilizationTimedOut();if(!stable&&!timedOut)return;
+  try{const messageId=newMessageId(),payload={type:'RIVULOG_BLE_MEASUREMENT',messageId,OperationID:messageId,tankId:TANK,measuredAt:LAST.measuredAt,pH:LAST.pH,EC_uScm:LAST.EC_uScm,TDS_ppm:LAST.TDS_ppm,Temperature_C:LAST.Temperature_C,stable,stabilizationTimedOut:timedOut,clipped:!!LAST.clipped,rawHex:LAST.rawHex||''};rvStoreOperation({version:1,state:'PENDING',instance:RV_INSTANCE,hostOrigin:RV_HOST,payload});rvSendOriginal();}catch(e){document.getElementById('saveState').textContent=e.message;}
 }
 function replyCapture(requestId,ok,reason='',messageId=''){
   try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_CAPTURE_RESULT',requestId:String(requestId||''),ok:!!ok,reason:String(reason||''),messageId:String(messageId||'')},'*')}catch(e){}
@@ -619,22 +620,24 @@ function handleVoiceCapture(msg){
   // This acknowledges capture initiation, not successful database saving.
 }
 window.addEventListener('message',e=>{
-  if(e.source!==window.opener)return;
+  if(e.source!==window.opener||e.origin!==RV_HOST||RV_STORAGE_ERROR)return;
   const msg=e.data||{};
   if(msg.type==='RIVULOG_CAPTURE_REQUEST'){handleVoiceCapture(msg);return}
   if(msg.type==='RIVULOG_SET_TANK'){resetForTank(msg.tankId);return}
   if(msg.type==='RIVULOG_MEASUREMENT_ACK'){
-    if(!SAVE_PENDING||String(msg.messageId||'')!==String(PENDING_MESSAGE_ID||''))return;
+    if(!RV_OPERATION||RV_OPERATION.state==='COMPLETE'||String(msg.messageId||'')!==RV_OPERATION.payload.messageId)return;
     if(SAVE_ACK_TIMER){clearTimeout(SAVE_ACK_TIMER);SAVE_ACK_TIMER=null}
     if(msg.ok){
-      const savedTank=PENDING_TANK||TANK;
+      const savedTank=RV_OPERATION.payload.tankId;
+      try{rvStoreOperation({...RV_OPERATION,state:'COMPLETE'})}catch(e){SAVE_PENDING=false;document.getElementById('saveState').textContent='Save confirmed but recovery storage failed. Preserve original operation and retry for confirmation.';updateStable();return;}
       SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';ARMED=false;stopReadPolling();resetStabilizeTimer();updateStable();
       document.getElementById('saveState').textContent=`Saved in RivuLog ✓ — ${savedTank}. Go back to RivuLog and tap the next tank.`;
       log('RivuLog confirmed save for '+savedTank);
     }else{
       const err=msg.error||'Unknown save error';
-      SAVE_PENDING=false;PENDING_MESSAGE_ID='';PENDING_TANK='';
-      document.getElementById('saveState').textContent='Save failed in RivuLog: '+err+' — press Confirm & Save to retry.';
+      SAVE_PENDING=false;
+      if(String(err).includes('H4_OPERATION_CONFLICT:')){try{rvStoreOperation({...RV_OPERATION,state:'CONFLICT'})}catch(e){RV_STORAGE_ERROR=e.message;}}
+      document.getElementById('saveState').textContent='Save unresolved in RivuLog: '+err+' — retry the ORIGINAL operation only.';
       log('SAVE FAILED: '+err);updateStable();startReadPolling();
     }
   }
