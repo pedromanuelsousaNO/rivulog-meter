@@ -88,11 +88,11 @@ body{max-width:1740px;margin:0 auto;padding:22px 25px}
 
 (()=>{'use strict';
 const $=id=>document.getElementById(id), SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-let hostOrigin=null,token=null,recognition=null,active=false,speaking=false,connected=false,seq=0,deletePrompt=null;let voiceState="Microphone off",voiceEpoch=0,restartTimer=null,voiceClosed=false,voiceStarting=false,voiceRunning=false,lastNavigationId=null;const diag=[];
+let hostOrigin=null,token=null,recognition=null,active=false,speaking=false,connected=false,seq=0,deletePrompt=null;let voiceState="Microphone off",voiceEpoch=0,restartTimer=null,voiceClosed=false,voiceStarting=false,voiceRunning=false,lastNavigationId=null,voiceCommandPending=null,eggConfirmationId=null,eggModeActive=false;const diag=[];
 const LANGUAGE_KEY="rivulog_voice_lang_v533";let language="pt-PT";try{language=localStorage.getItem(LANGUAGE_KEY)||"pt-PT"}catch(e){}if(!["pt-PT","en-GB","en-US"].includes(language))language="pt-PT";$("language").value=language;
 const pt=()=>language==='pt-PT';const tr=(en,port)=>pt()?port:en;
 const sayStatus=s=>{$('status').textContent=s};
-const phrases=[['Next tank','Próximo aquário / Próximo'],['Previous tank','Aquário anterior / Anterior'],['Tank eighteen','Aquário dezoito / Tanque dezoito'],['Show trend / Show charts','Mostrar gráficos / Ver gráficos'],['Hide trend / Close trend','Fechar gráficos / Voltar'],['Repeat','Repetir'],['Save reading','Guardar leitura / Guardar'],['Delete last reading','Apagar última leitura'],['Confirm deletion','Confirmar eliminação'],['Cancel deletion','Cancelar eliminação'],['Stop listening','Parar de ouvir'],['Close window','Fechar aplicação']];
+const phrases=[['Next tank','Próximo aquário / Próximo'],['Previous tank','Aquário anterior / Anterior'],['Tank eighteen','Aquário dezoito / Tanque dezoito'],['Show trend / Show charts','Mostrar gráficos / Ver gráficos'],['Hide trend / Close trend','Fechar gráficos / Voltar'],['Repeat last saved reading','Repetir'],['Review live reading','Ler leitura atual'],['Save reading','Guardar leitura / Registar leitura'],['Delete last reading','Apagar última leitura'],['Confirm deletion','Confirmar eliminação'],['Cancel deletion','Cancelar eliminação'],['Cancel command','Cancelar comando'],['Register eggs','Registar ovos / Adicionar ovos'],['Egg quantity','Sete ovos / 12 ovos'],['Confirm pending eggs','Confirmar'],['Correct quantity','Corrigir quantidade'],['Change egg tank','Mudar aquário'],['Choose parents','Grupo dois'],['Parent-count evidence','Contagens desconhecidas / Usar contagens registadas'],['Stop listening','Parar de ouvir'],['Close window','Fechar aplicação']];
 function renderDiag(){
  $('diagtitle').textContent=tr('Command history','Histórico de comandos');
  $('cleardiag').textContent=tr('Clear','Limpar');
@@ -110,6 +110,10 @@ function hello(){if(!window.opener){$('connection').textContent=tr('Open this wi
 function localizeReply(message){
  const raw=String(message||'').trim();
  if(!pt())return raw;
+ if(/^Previous save unresolved|^Save outcome unresolved/.test(raw))return 'A gravação anterior continua por confirmar. Não foi iniciada outra gravação; preserva a operação original.';
+ if(/^Meter not ready:/.test(raw))return 'Leitura não guardada. Verifica a ligação, a estabilização e qualquer operação pendente no medidor.';
+ if(raw==='No pending action to cancel.')return 'Nenhuma ação pendente para cancelar.';
+
  if(/(?:[ãõáàâéêíóôúç]|\b(?:aquário|gráficos|leitura|guardar|selecionado|ligado|comando|microfone)\b)/i.test(raw) && !/^(?:Tank|Showing|Returned|Please|Open|Save|Command|No tank|Trends)/i.test(raw))return raw;
  let m;
  if((m=raw.match(/^Measurement saved for tank\s+(\d+)\.$/i)))return 'Leitura guardada no aquário '+m[1]+'.';
@@ -188,13 +192,52 @@ const ones={zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:
 const ptOnes={zero:0,um:1,uma:1,dois:2,duas:2,tres:3,quatro:4,cinco:5,seis:6,sete:7,oito:8,nove:9,dez:10,onze:11,doze:12,treze:13,catorze:14,quatorze:14,quinze:15,dezasseis:16,dezassete:17,dezoito:18,dezanove:19};
 const ptTens={vinte:20,trinta:30,quarenta:40,cinquenta:50,sessenta:60,setenta:70,oitenta:80,noventa:90};
 function normalize(v){return String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[.,!?;:]/g,' ').replace(/[-_]/g,' ').replace(/\s+/g,' ').trim()}
-function numberFrom(v){v=normalize(v).replace(/^(?:numero|number|n\.?|no\.?)\s*/, '');if(/^\d+$/.test(v))return Number(v);let p=v.split(/\s+/).filter(x=>x!=='and'&&x!=='e');if(p.length===1)return ones[p[0]]??tens[p[0]]??ptOnes[p[0]]??ptTens[p[0]]??NaN;if(p.length===2){if(tens[p[0]]!==undefined&&ones[p[1]]!==undefined)return tens[p[0]]+ones[p[1]];if(ptTens[p[0]]!==undefined&&ptOnes[p[1]]!==undefined)return ptTens[p[0]]+ptOnes[p[1]];}return NaN}
-function parse(text){const s=normalize(text);
+// Explicit whole-utterance aliases. Add future command groups here; never fuzzy-match writes.
+const VOICE_VOCABULARY=Object.freeze({
+ eggStart:Object.freeze(['registar ovos','registrar ovos','adicionar ovos','recolher ovos']),
+ eggConfirm:Object.freeze(['confirmar']),
+ eggCorrect:Object.freeze(['corrigir quantidade']),
+ eggChangeTank:Object.freeze(['mudar aquario']),
+ eggUnknown:Object.freeze(['contagens desconhecidas']),
+ eggCopied:Object.freeze(['usar contagens registadas']),
+ save:Object.freeze(['guardar medicao','registar a leitura','registar medicao','gravar a medicao','gorda leitura','gorda a leitura']),
+ next:Object.freeze(['seguinte aquario','ir para o proximo aquario','avancar aquario']),
+ previous:Object.freeze(['voltar ao aquario anterior','ir para o aquario anterior']),
+ review:Object.freeze(['ler a leitura','ler os valores','rever leitura','ler leitura atual','leitura atual']),
+ cancel:Object.freeze(['cancelar','cancela','cancelar comando','cancelar leitura','cancelar gravação','cancel command']),
+ stop:Object.freeze(['parar microfone','parar de escutar'])
+});
+function vocabularyCommand(s){for(const [command,aliases] of Object.entries(VOICE_VOCABULARY))if(aliases.some(a=>normalize(a)===s))return {command};return null;}
+function chooseVoiceCommand(choices){
+ const primary=parse(choices[0]||''),parsed=choices.map(parse).filter(p=>p.command!=='unknown'&&(p.command!=='tank'||Number.isFinite(p.tank)));
+ const keys=new Set(parsed.map(p=>p.command+':'+(p.tank??'')));
+ if(keys.size>1)return {command:'unknown',reason:'ambiguous'};
+ if(parsed.some(p=>p.command.startsWith('egg'))&&primary.command==='unknown')return {command:'unknown'};
+ if(primary.command!=='unknown')return primary;
+ // A lower-ranked interpretation may navigate, but can never initiate a write.
+ return parsed.find(p=>['tank','next','previous','trend','hideTrend','repeat','review','stop'].includes(p.command))||{command:'unknown'};
+}
+function numberFrom(v){
+ v=normalize(v).replace(/^(?:numero|number|n|no)\s+/, '');
+ if(/^(?:t)?\d+$/.test(v)){const n=Number(v.replace(/^t/,''));return Number.isSafeInteger(n)&&n>0?n:NaN;}
+ if(v==='cem')return 100;
+ if(v.startsWith('cento e ')){const n=numberFrom(v.slice(8));return n>0&&n<100?100+n:NaN;}
+ const p=v.split(' ');let n;
+ if(p.length===1)n=ones[p[0]]??tens[p[0]]??ptOnes[p[0]]??ptTens[p[0]];
+ else if(p.length===2||(p.length===3&&['e','and'].includes(p[1]))){
+  const unit=p.at(-1),base=tens[p[0]]??ptTens[p[0]],u=ones[unit]??ptOnes[unit];
+  if(base!==undefined&&u>0&&u<10)n=base+u;
+ }
+ return Number.isFinite(n)&&n>0?n:NaN;
+}
+function parse(text){if(/(?:^|\s)[-−]\s*\d/.test(String(text)))return {command:'unknown'};const s=normalize(text);const alias=vocabularyCommand(s);if(alias)return alias;
+ const q=s.match(/^(.+) ovos?$/);if(q)return Number.isSafeInteger(numberFrom(q[1]))?{command:'eggQuantity',tank:numberFrom(q[1])}:{command:'unknown'};
+ const g=s.match(/^(?:grupo|populacao) (.+)$/);if(g)return Number.isSafeInteger(numberFrom(g[1]))?{command:'eggParent',tank:numberFrom(g[1])}:{command:'unknown'};
  if(/^(close|close window|close voice bridge|exit|quit|fechar|fechar aplicacao|fechar janela|sair|terminar aplicacao)$/.test(s))return{command:'close'};
  if(/^(stop listening|stop voice|microphone off|parar de ouvir|parar escuta|desligar microfone)$/.test(s))return{command:'stop'};
  if(/^(next tank|next|next aquarium|proximo|proximo aquario|proximo tanque|aquario seguinte|tanque seguinte|passar ao proximo|seguinte)$/.test(s))return{command:'next'};
  if(/^(previous tank|previous|back tank|previous aquarium|anterior|aquario anterior|tanque anterior|ir para o anterior|voltar ao aquario anterior)$/.test(s))return{command:'previous'};
- const t=s.match(/^(?:(?:select|go to|choose)\s+)?(?:tank|aquario|tanque)\s*(?:number|numero)?\s*(.+)$/);
+ const t=s.match(/^(?:(?:select|go to|choose|selecionar|seleccionar|selecciona|seleciona|seleccione|escolher|escolhe|ir para|vai para)(?:\s+o)?\s+)?(?:tank|aquario|tanque)\s*(?:number|numero)?\s*(.+)$/);
  if(t)return{command:'tank',tank:numberFrom(t[1])};
  if(/^(show trend|show trends|show history|show charts|view charts|open charts|display charts|mostrar graficos|mostrar grafico|mostra graficos|mostra os graficos|ver grafico|ver graficos|abrir graficos|graficos|ver tendencias|mostrar tendencias|historico)$/.test(s))return{command:'trend'};
  if(/^(hide trend|hide trends|close trend|close trends|close charts|hide charts|back to testing|live view|fechar graficos|fechar grafico|fecha graficos|fecha os graficos|tirar graficos|esconder graficos|ocultar graficos|voltar|voltar aos testes|fechar tendencias|esconder tendencias)$/.test(s))return{command:'hideTrend'};
@@ -208,9 +251,13 @@ function parse(text){const s=normalize(text);
 function voiceStateSet(state,detail){voiceState=state;$('status').textContent=tr(state,state==='Listening'?'A ouvir':state==='Stopping'?'A parar':state==='Microphone off'?'Microfone desligado':'Erro')+(detail?' — '+detail:'');$('status').dataset.voiceState=state;$('start').disabled=state==='Listening'||state==='Stopping';$('stop').disabled=state!=='Listening';}
 function cancelVoiceRestart(){if(restartTimer!==null){clearTimeout(restartTimer);restartTimer=null;}}
 function stop(){active=false;cancelVoiceRestart();const old=recognition,awaitEnd=voiceStarting||voiceRunning,ticket=++voiceEpoch;recognition=null;voiceStarting=false;voiceRunning=false;if(old){voiceStateSet(awaitEnd?'Stopping':'Microphone off');old.onend=()=>{if(voiceEpoch===ticket&&voiceState==='Stopping')voiceStateSet('Microphone off');};try{old.abort()}catch(e){voiceStateSet('Error',String(e.message||e))}}else voiceStateSet('Microphone off');try{speechSynthesis.cancel()}catch(e){}signal('RV_VOICE_STATUS',{status:'Voice microphone stop requested.'});}
-function voiceError(e){active=false;cancelVoiceRestart();const old=recognition;++voiceEpoch;recognition=null;voiceStarting=false;voiceRunning=false;voiceStateSet('Error',String(e?.error||e?.message||e));try{old?.abort()}catch(ignore){}}
+function voiceError(e){active=false;cancelVoiceRestart();const old=recognition;++voiceEpoch;recognition=null;voiceStarting=false;voiceRunning=false;signal('RV_VOICE_INTERRUPTED',{reason:String(e?.error||e?.message||e)});voiceStateSet('Error',String(e?.error||e?.message||e));try{old?.abort()}catch(ignore){}}
 function restart(){if(!active||voiceClosed||speaking||!connected||!recognition||voiceStarting||voiceRunning)return;try{voiceStarting=true;recognition.start()}catch(e){voiceError(e)}}
-function start(){if(voiceClosed||voiceState==='Stopping'||active)return;if(!connected){voiceStateSet('Error',tr('Open this page from RivuLog.','Abre esta janela a partir do RivuLog.'));return}if(!window.isSecureContext||!SR){voiceStateSet('Error',tr('Secure Chrome/Edge speech recognition required.','É necessário reconhecimento de voz seguro no Chrome/Edge.'));return}const session=new SR(),epoch=++voiceEpoch;recognition=session;active=true;session.lang=language;session.continuous=false;session.interimResults=false;session.maxAlternatives=3;const valid=()=>!voiceClosed&&active&&recognition===session&&voiceEpoch===epoch;voiceStateSet('Listening',tr('Starting microphone','A iniciar microfone'));session.onstart=()=>{if(!valid())return;voiceStarting=false;voiceRunning=true;voiceStateSet('Listening',tr('Say Next tank','Diz Próximo aquário'));signal('RV_VOICE_STATUS',{status:'Listening for commands'});};session.onerror=e=>{if(valid())voiceError(e);};session.onend=()=>{if(!valid())return;voiceStarting=false;voiceRunning=false;if(speaking)return;cancelVoiceRestart();restartTimer=setTimeout(()=>{restartTimer=null;if(valid())restart()},700);};session.onresult=e=>{if(!valid())return;const choices=Array.from(e.results[e.results.length-1]).map(x=>x.transcript);const heard=choices[0];$('heard').textContent=heard;const parsed=choices.map(parse).find(x=>x.command!=='unknown'&&(x.command!=='tank'||Number.isFinite(x.tank)))||parse(heard);if(parsed.command==='stop'){logDiag(heard,'stop',tr('Executed','Executado'));stop();return}if(parsed.command==='close'){logDiag(heard,'close',tr('Executed','Executado'));stop();window.close();$('result').textContent=tr('Close this tab manually if the browser blocked automatic closing.','Fecha esta janela manualmente se o navegador impediu o fecho automático.');return}if(parsed.command==='unknown'||(parsed.command==='tank'&&!Number.isFinite(parsed.tank))){$('result').textContent=tr('Command not understood','Comando não reconhecido');logDiag(heard,'unknown',tr('Not recognized','Não reconhecido'));speak('Command not understood.');return}if(parsed.command==='hideTrend')hideTrends();if(parsed.command==='confirmDelete'&&!deletePrompt){$('result').textContent=tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.');logDiag(heard,'confirmDelete',tr('Rejected','Recusado'));speak(tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.'));return}const commandId=++seq;if(['tank','next','previous'].includes(parsed.command))lastNavigationId=commandId;logDiag(heard,parsed.command+(parsed.command==='tank'?' '+parsed.tank:''),tr('Sent to RivuLog','Enviado ao RivuLog'),commandId);signal('RV_VOICE_CMD',{...parsed,heard,commandId,...(parsed.command==='confirmDelete'?{deleteToken:deletePrompt.deleteToken}:{})});$('result').textContent=tr('Waiting for RivuLog…','À espera do RivuLog…')};restart()}
+function start(){if(voiceClosed||voiceState==='Stopping'||active)return;if(!connected){voiceStateSet('Error',tr('Open this page from RivuLog.','Abre esta janela a partir do RivuLog.'));return}if(!window.isSecureContext||!SR){voiceStateSet('Error',tr('Secure Chrome/Edge speech recognition required.','É necessário reconhecimento de voz seguro no Chrome/Edge.'));return}const session=new SR(),epoch=++voiceEpoch;recognition=session;active=true;session.lang=language;session.continuous=false;session.interimResults=false;session.maxAlternatives=3;const valid=()=>!voiceClosed&&active&&recognition===session&&voiceEpoch===epoch;voiceStateSet('Listening',tr('Starting microphone','A iniciar microfone'));session.onstart=()=>{if(!valid())return;voiceStarting=false;voiceRunning=true;voiceStateSet('Listening',tr('Say Next tank','Diz Próximo aquário'));signal('RV_VOICE_STATUS',{status:'Listening for commands'});};session.onerror=e=>{if(valid())voiceError(e);};session.onend=()=>{if(!valid())return;voiceStarting=false;voiceRunning=false;if(speaking)return;cancelVoiceRestart();restartTimer=setTimeout(()=>{restartTimer=null;if(valid())restart()},700);};session.onresult=e=>{if(!valid()||e.results[e.results.length-1].isFinal===false)return;const choices=Array.from(e.results[e.results.length-1]).map(x=>x.transcript);const heard=choices[0];$('heard').textContent=heard;const parsed=chooseVoiceCommand(choices);if(parsed.reason==='ambiguous'){ $('result').textContent=tr('Ambiguous command. Please repeat one command.','Comando ambíguo. Repete apenas um comando.');logDiag(heard,'unknown',tr('Ambiguous','Ambíguo'));return}if(parsed.command==='stop'){logDiag(heard,'stop',tr('Executed','Executado'));stop();return}if(parsed.command==='close'){logDiag(heard,'close',tr('Executed','Executado'));stop();window.close();$('result').textContent=tr('Close this tab manually if the browser blocked automatic closing.','Fecha esta janela manualmente se o navegador impediu o fecho automático.');return}if(parsed.command==='unknown'||(parsed.command==='tank'&&!Number.isFinite(parsed.tank))){$('result').textContent=tr('Command not understood','Comando não reconhecido');logDiag(heard,'unknown',tr('Not recognized','Não reconhecido'));speak('Command not understood.');return}if((parsed.command==='save'&&eggModeActive)||(parsed.command==='eggStart'&&voiceCommandPending!==null)){$('result').textContent=tr('Finish or reconcile the pending workflow first.','Termine ou reconcilie primeiro o modo pendente.');logDiag(heard,parsed.command,tr('Blocked: another workflow','Bloqueado: outro modo ativo'));return}if(parsed.command==='save'&&voiceCommandPending!==null){$('result').textContent=tr('Previous save unresolved. Preserve the original operation.','A leitura anterior ainda não foi confirmada. Preserva a operação original.');logDiag(heard,'save',tr('Blocked: pending save','Bloqueado: gravação pendente'));return}if(parsed.command==='review'){
+ const r=currentVoiceReading();
+ const message=r?tr('Current stable reading: ','Leitura atual estável: ')+'pH '+r.pH+'; '+tr('conductivity ','condutividade ')+r.EC_uScm+' µS/cm; TDS '+r.TDS_ppm+' ppm; '+tr('temperature ','temperatura ')+r.Temperature_C+' °C.':tr('No fresh stable BLE reading available. Nothing was saved.','Não existe uma leitura BLE recente e estável. Nenhuma leitura foi guardada.');
+ $('result').textContent=message;logDiag(heard,'review',message);speak(message);return;
+}if(parsed.command==='hideTrend')hideTrends();if(parsed.command==='confirmDelete'&&!deletePrompt){$('result').textContent=tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.');logDiag(heard,'confirmDelete',tr('Rejected','Recusado'));speak(tr('No deletion is awaiting confirmation.','Não existe uma eliminação para confirmar.'));return}const commandId=++seq;if(parsed.command==='save')voiceCommandPending=commandId;if(['tank','next','previous'].includes(parsed.command))lastNavigationId=commandId;logDiag(heard,parsed.command+(parsed.command==='tank'?' '+parsed.tank:''),tr('Sent to RivuLog','Enviado ao RivuLog'),commandId);signal('RV_VOICE_CMD',{...parsed,heard,commandId,...(parsed.command==='eggConfirm'?{eggConfirmationId}:{}),...(parsed.command==='confirmDelete'?{deleteToken:deletePrompt.deleteToken}:{})});$('result').textContent=tr('Waiting for RivuLog…','À espera do RivuLog…')};restart()}
 $('start').onclick=start;$('stop').onclick=stop;window.rivuLogVoiceStart=start;window.rivuLogVoiceStop=stop;$('hidetrend').onclick=()=>{hideTrends();signal('RV_VOICE_CMD',{command:'hideTrend',commandId:++seq,heard:'Hide trend'})};
 function hideTrends(){$('trends').hidden=true}
 function clearDeletePrompt(){deletePrompt=null;$('deletePrompt').hidden=true}
@@ -282,7 +329,7 @@ function drawTrends(m){
  $('trends').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-window.addEventListener('message',e=>{if(e.source!==window.opener)return;const m=e.data||{};if(m.type==='RV_VOICE_INIT'){if(!m.token||!m.pageOrigin||e.origin!==m.pageOrigin)return;if(connected&&(e.origin!==hostOrigin||m.token!==token))return;hostOrigin=e.origin;token=m.token;connected=true;showMainSelection(m.selectedTankId);$('connection').textContent=tr('✓ Connected to RivuLog','✓ Ligado ao RivuLog');sayStatus(tr('Connected — click Start listening','Ligado — clica em Iniciar escuta'));return}if(!connected||e.origin!==hostOrigin||m.token!==token)return;if(m.type==='RV_VOICE_TRENDS'){drawTrends(m);return}if(m.type==='RV_VOICE_DELETE_PROMPT'){showDeletePrompt(m);return}if(m.type==='RV_VOICE_DELETE_CLEAR'){clearDeletePrompt();return}if(m.type==='RV_VOICE_DELETE_WORKING'){$('deleteConfirm').disabled=true;$('result').textContent=tr('Deleting selected reading…','A apagar a leitura selecionada…');return}if(m.type==='RV_VOICE_ACK'){if(m.commandId===lastNavigationId){showMainSelection(m.selectedTankId);lastNavigationId=null;}const message=String(m.result||'');const localized=localizeReply(message);$('result').textContent=localized||message||tr('Command processed','Comando executado');updateDiag(m.commandId,localized||message||tr('Acknowledged','Confirmado'));if(message)speak(message);else speak(tr('Command processed','Comando executado'));}});
+window.addEventListener('message',e=>{if(e.source!==window.opener)return;const m=e.data||{};if(m.type==='RV_VOICE_INIT'){if(!m.token||!m.pageOrigin||e.origin!==m.pageOrigin)return;if(connected&&(e.origin!==hostOrigin||m.token!==token))return;hostOrigin=e.origin;token=m.token;connected=true;showMainSelection(m.selectedTankId);$('connection').textContent=tr('✓ Connected to RivuLog','✓ Ligado ao RivuLog');sayStatus(tr('Connected — click Start listening','Ligado — clica em Iniciar escuta'));return}if(!connected||e.origin!==hostOrigin||m.token!==token)return;if(m.type==='RV_VOICE_EGG_STATE'){eggModeActive=m.phase!=='IDLE';eggConfirmationId=m.phase==='REVIEW'?String(m.confirmationId||''):null;const text=String(m.result||'');$('result').textContent=text;updateDiag(seq,text);if(text)speak(text);return}if(m.type==='RV_VOICE_TRENDS'){drawTrends(m);return}if(m.type==='RV_VOICE_DELETE_PROMPT'){showDeletePrompt(m);return}if(m.type==='RV_VOICE_DELETE_CLEAR'){clearDeletePrompt();return}if(m.type==='RV_VOICE_DELETE_WORKING'){$('deleteConfirm').disabled=true;$('result').textContent=tr('Deleting selected reading…','A apagar a leitura selecionada…');return}if(m.type==='RV_VOICE_ACK'){if(m.commandId===voiceCommandPending&&m.pending!==true)voiceCommandPending=null;if(m.commandId===lastNavigationId){showMainSelection(m.selectedTankId);lastNavigationId=null;}const message=String(m.result||'');const localized=localizeReply(message);$('result').textContent=localized||message||tr('Command processed','Comando executado');updateDiag(m.commandId,localized||message||tr('Acknowledged','Confirmado'));if(message)speak(message);else speak(tr('Command processed','Comando executado'));}});
 window.addEventListener('pagehide',()=>{voiceClosed=true;stop()});hello();setTimeout(()=>{if(!connected)hello()},1200);
 })();
 
@@ -598,6 +645,11 @@ function confirmMeasurement(){
 function replyCapture(requestId,ok,reason='',messageId=''){
   try{if(window.opener&&!window.opener.closed)window.opener.postMessage({type:'RIVULOG_CAPTURE_RESULT',requestId:String(requestId||''),ok:!!ok,reason:String(reason||''),messageId:String(messageId||'')},'*')}catch(e){}
 }
+function currentVoiceReading(){
+ const age=Date.now()-Date.parse(LAST?.measuredAt||'');
+ if(!DEVICE?.gatt?.connected||!TARGET_CHAR||!ARMED||!TANK||!LAST||!validReading(LAST)||!['pH','EC_uScm','TDS_ppm','Temperature_C'].every(k=>typeof LAST[k]==='number'&&Number.isFinite(LAST[k]))||!Number.isFinite(age)||age<0||age>4000||!isStable())return null;
+ return {...LAST};
+}
 function handleVoiceCapture(msg){
   const requestId=String(msg.requestId||'');
   const expectedTank=String(msg.tankId||'');
@@ -606,12 +658,13 @@ function handleVoiceCapture(msg){
   if(VOICE_CAPTURE_REQUESTS.size>50)VOICE_CAPTURE_REQUESTS.delete(VOICE_CAPTURE_REQUESTS.values().next().value);
   const refuse=reason=>{log('VOICE CAPTURE BLOCKED: '+reason);document.getElementById('saveState').textContent=reason;replyCapture(requestId,false,reason)};
   if(SAVE_PENDING)return refuse('A measurement is already being saved.');
+  if(RV_STORAGE_ERROR||(RV_OPERATION&&RV_OPERATION.state!=='COMPLETE'))return refuse('Previous save unresolved. Retry only the original operation manually.');
   if(!DEVICE?.gatt?.connected||!TARGET_CHAR)return refuse('The Bluetooth meter is disconnected.');
   if(!ARMED||!TANK||expectedTank!==String(TANK))return refuse('The meter is not armed for the selected tank.');
-  if(!LAST||!validReading(LAST))return refuse('No valid BLE measurement is available yet.');
+  if(!LAST||!validReading(LAST)||!['pH','EC_uScm','TDS_ppm','Temperature_C'].every(k=>typeof LAST[k]==='number'&&Number.isFinite(LAST[k])))return refuse('No valid BLE measurement is available yet.');
   const ageMs=Date.now()-Date.parse(LAST.measuredAt||'');
   if(!Number.isFinite(ageMs)||ageMs<0||ageMs>4000)return refuse('The last measurement is stale. Wait for a fresh reading.');
-  if(!isStable()&&!stabilizationTimedOut())return refuse('The reading is still stabilizing. Wait up to 15 seconds.');
+  if(!isStable())return refuse('The reading is still stabilizing. Voice saving requires a stable reading.');
   log('VOICE CAPTURE: Confirm & Save requested for '+TANK);
   confirmMeasurement();
   if(!SAVE_PENDING)return refuse('The meter could not start saving this reading.');
